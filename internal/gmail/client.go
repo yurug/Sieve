@@ -81,15 +81,51 @@ type Label struct {
 type DraftRequest struct {
 	To      []string `json:"to"`
 	Cc      []string `json:"cc,omitempty"`
+	Bcc     []string `json:"bcc,omitempty"`
 	Subject string   `json:"subject"`
 	Body    string   `json:"body"`
-	ReplyTo string   `json:"reply_to,omitempty"` // message ID to reply to
+
+	// ReplyTo is the LEGACY threading field: a Gmail message id that was
+	// (incorrectly) used both as the draft's threadId and as the In-Reply-To
+	// header. Retained for backward compatibility; new callers should use the
+	// fields below, which separate the two distinct identifiers Gmail needs.
+	ReplyTo string `json:"reply_to,omitempty"`
+
+	// Threading (proper). To draft/send a reply INTO an existing conversation
+	// Gmail needs BOTH of these, and they are different identifiers:
+	//   - ThreadID: the Gmail *thread* id (e.g. "19feb7fece7ad70d"). Sets the
+	//     message's threadId so Gmail files it in the same conversation.
+	//   - InReplyTo: the parent message's RFC 5322 *Message-ID* header value
+	//     (e.g. "<CANrf...@mail.gmail.com>"). Written as In-Reply-To so the
+	//     recipient's client and downstream ticketing systems can thread on it.
+	//   - References: the RFC 5322 References chain (parent's References plus the
+	//     parent's Message-ID). Written verbatim as the References header.
+	// Angle brackets are optional on input — normalizeMessageIDs adds them.
+	ThreadID   string `json:"thread_id,omitempty"`
+	InReplyTo  string `json:"in_reply_to,omitempty"`
+	References string `json:"references,omitempty"`
+}
+
+// threadID returns the Gmail thread id to attach a message to: the explicit
+// ThreadID when set, else the legacy ReplyTo value (preserving old behavior).
+func (r DraftRequest) threadID() string {
+	if r.ThreadID != "" {
+		return r.ThreadID
+	}
+	return r.ReplyTo
 }
 
 // Draft represents a Gmail draft.
 type Draft struct {
 	ID      string `json:"id"`
 	Message Email  `json:"message"`
+}
+
+// DraftStub is the lightweight shape returned by ListDrafts: the draft id plus
+// a stub of its message (no body), mirroring EmailStub for list_emails.
+type DraftStub struct {
+	ID      string    `json:"id"`
+	Message EmailStub `json:"message"`
 }
 
 // SearchQuery defines parameters for searching emails.
@@ -254,8 +290,8 @@ func (c *Client) CreateDraft(ctx context.Context, req DraftRequest) (*Draft, err
 	gmailMsg := &gmail.Message{
 		Raw: base64.URLEncoding.EncodeToString(raw),
 	}
-	if req.ReplyTo != "" {
-		gmailMsg.ThreadId = req.ReplyTo
+	if tid := req.threadID(); tid != "" {
+		gmailMsg.ThreadId = tid
 	}
 
 	draft := &gmail.Draft{
@@ -290,8 +326,8 @@ func (c *Client) UpdateDraft(ctx context.Context, draftID string, req DraftReque
 	gmailMsg := &gmail.Message{
 		Raw: base64.URLEncoding.EncodeToString(raw),
 	}
-	if req.ReplyTo != "" {
-		gmailMsg.ThreadId = req.ReplyTo
+	if tid := req.threadID(); tid != "" {
+		gmailMsg.ThreadId = tid
 	}
 
 	draft := &gmail.Draft{
@@ -325,8 +361,8 @@ func (c *Client) SendEmail(ctx context.Context, req DraftRequest) (*Email, error
 	gmailMsg := &gmail.Message{
 		Raw: base64.URLEncoding.EncodeToString(raw),
 	}
-	if req.ReplyTo != "" {
-		gmailMsg.ThreadId = req.ReplyTo
+	if tid := req.threadID(); tid != "" {
+		gmailMsg.ThreadId = tid
 	}
 
 	sent, err := c.service.Users.Messages.Send("me", gmailMsg).Context(ctx).Do()
@@ -363,6 +399,105 @@ func (c *Client) SendDraft(ctx context.Context, draftID string) (*Email, error) 
 	}
 
 	return &Email{}, nil
+}
+
+// ReplyContext carries everything needed to draft/send a reply that threads
+// correctly into an existing conversation, derived from a parent message.
+type ReplyContext struct {
+	ThreadID  string `json:"thread_id"`  // Gmail thread id of the conversation
+	MessageID string `json:"message_id"` // parent's RFC 5322 Message-ID header
+	// References is the RFC 5322 References chain to carry forward: the parent's
+	// own References (if any) followed by the parent's Message-ID.
+	References string `json:"references"`
+	Subject    string `json:"subject"` // parent subject (for "Re:" derivation)
+}
+
+// GetReplyContext fetches the metadata a caller needs to reply into the thread
+// containing messageID: the Gmail threadId plus the parent's Message-ID,
+// References, and Subject headers. This is the lookup behind the
+// in_reply_to_message_id convenience — the one call an agent making a reply
+// actually wants, so it doesn't have to fetch the parent and assemble headers
+// itself. Only the four threading headers are requested (format=metadata), so
+// the body is never pulled into the response.
+func (c *Client) GetReplyContext(ctx context.Context, messageID string) (*ReplyContext, error) {
+	msg, err := c.service.Users.Messages.Get("me", messageID).
+		Context(ctx).
+		Format("metadata").
+		MetadataHeaders("Message-ID", "References", "Subject").
+		Do()
+	if err != nil {
+		return nil, fmt.Errorf("gmail: getting reply context for %s: %w", messageID, err)
+	}
+	rc := &ReplyContext{ThreadID: msg.ThreadId}
+	var parentMsgID, parentRefs string
+	if msg.Payload != nil {
+		for _, h := range msg.Payload.Headers {
+			switch strings.ToLower(h.Name) {
+			case "message-id":
+				parentMsgID = strings.TrimSpace(h.Value)
+			case "references":
+				parentRefs = strings.TrimSpace(h.Value)
+			case "subject":
+				rc.Subject = h.Value
+			}
+		}
+	}
+	rc.MessageID = parentMsgID
+	// RFC 5322 §3.6.4: the reply's References is the parent's References (if
+	// present) with the parent's Message-ID appended.
+	switch {
+	case parentRefs != "" && parentMsgID != "":
+		rc.References = parentRefs + " " + parentMsgID
+	case parentMsgID != "":
+		rc.References = parentMsgID
+	default:
+		rc.References = parentRefs
+	}
+	return rc, nil
+}
+
+// ListDrafts returns the account's drafts as lightweight stubs (draft id plus
+// the draft message's id/threadId and its From/To/Cc/Subject/Date/Snippet
+// headers) — no body, mirroring ListEmails. maxResults defaults to 100 and is
+// capped at 500. Without this, a caller can neither find nor verify the drafts
+// it previously created.
+func (c *Client) ListDrafts(ctx context.Context, maxResults int64) ([]DraftStub, error) {
+	if maxResults <= 0 {
+		maxResults = 100
+	}
+	if maxResults > 500 {
+		maxResults = 500
+	}
+	resp, err := c.service.Users.Drafts.List("me").Context(ctx).MaxResults(maxResults).Do()
+	if err != nil {
+		return nil, fmt.Errorf("gmail: listing drafts: %w", err)
+	}
+	stubs := make([]DraftStub, 0, len(resp.Drafts))
+	for _, d := range resp.Drafts {
+		stub := DraftStub{ID: d.Id}
+		if d.Message != nil {
+			meta, err := c.service.Users.Messages.Get("me", d.Message.Id).
+				Context(ctx).
+				Format("metadata").
+				MetadataHeaders(stubMetadataHeaders...).
+				Do()
+			if err != nil {
+				return nil, fmt.Errorf("gmail: getting draft message %s: %w", d.Message.Id, err)
+			}
+			stub.Message = parseEmailStub(meta)
+		}
+		stubs = append(stubs, stub)
+	}
+	return stubs, nil
+}
+
+// DeleteDraft permanently removes a draft by id. Pairs with ListDrafts so a bad
+// draft can be cleaned up programmatically rather than by hand in the Gmail UI.
+func (c *Client) DeleteDraft(ctx context.Context, draftID string) error {
+	if err := c.service.Users.Drafts.Delete("me", draftID).Context(ctx).Do(); err != nil {
+		return fmt.Errorf("gmail: deleting draft %s: %w", draftID, err)
+	}
+	return nil
 }
 
 // AddLabel adds a label to a message.
@@ -624,15 +759,49 @@ func buildMIMEMessage(req DraftRequest) ([]byte, error) {
 	if len(req.Cc) > 0 {
 		buf.WriteString(fmt.Sprintf("Cc: %s\r\n", strings.Join(req.Cc, ", ")))
 	}
+	if len(req.Bcc) > 0 {
+		buf.WriteString(fmt.Sprintf("Bcc: %s\r\n", strings.Join(req.Bcc, ", ")))
+	}
 	buf.WriteString(fmt.Sprintf("Subject: %s\r\n", req.Subject))
 
-	if req.ReplyTo != "" {
-		buf.WriteString(fmt.Sprintf("In-Reply-To: <%s>\r\n", req.ReplyTo))
-		buf.WriteString(fmt.Sprintf("References: <%s>\r\n", req.ReplyTo))
+	// Threading headers. Prefer the explicit InReplyTo/References; fall back to
+	// the legacy ReplyTo (a Gmail message id used as a stand-in Message-ID).
+	inReplyTo := req.InReplyTo
+	references := req.References
+	if inReplyTo == "" && req.ReplyTo != "" {
+		inReplyTo = req.ReplyTo
+		if references == "" {
+			references = req.ReplyTo
+		}
+	}
+	if inReplyTo != "" {
+		buf.WriteString(fmt.Sprintf("In-Reply-To: %s\r\n", normalizeMessageIDs(inReplyTo)))
+	}
+	if references != "" {
+		buf.WriteString(fmt.Sprintf("References: %s\r\n", normalizeMessageIDs(references)))
 	}
 
 	buf.WriteString("\r\n")
 	buf.WriteString(req.Body)
 
 	return []byte(buf.String()), nil
+}
+
+// normalizeMessageIDs ensures every whitespace-separated token in an
+// In-Reply-To / References value is wrapped in angle brackets, so callers may
+// pass ids with or without them. A token already shaped like "<...>" is left
+// as-is; a bare "abc@host" becomes "<abc@host>". Empty tokens are dropped.
+func normalizeMessageIDs(s string) string {
+	fields := strings.Fields(s)
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if !strings.HasPrefix(f, "<") {
+			f = "<" + f
+		}
+		if !strings.HasSuffix(f, ">") {
+			f = f + ">"
+		}
+		out = append(out, f)
+	}
+	return strings.Join(out, " ")
 }

@@ -108,6 +108,8 @@ func (rt *Router) Handler() http.Handler {
 	mux.HandleFunc("GET /gmail/v1/users/{userId}/threads/{id}", rt.gmailGetThread)
 	mux.HandleFunc("POST /gmail/v1/users/{userId}/messages/send", rt.gmailSendMessage)
 	mux.HandleFunc("POST /gmail/v1/users/{userId}/drafts", rt.gmailCreateDraft)
+	mux.HandleFunc("GET /gmail/v1/users/{userId}/drafts", rt.gmailListDrafts)
+	mux.HandleFunc("DELETE /gmail/v1/users/{userId}/drafts/{id}", rt.gmailDeleteDraft)
 	mux.HandleFunc("GET /gmail/v1/users/{userId}/labels", rt.gmailListLabels)
 	mux.HandleFunc("POST /gmail/v1/users/{userId}/messages/{id}/modify", rt.gmailModifyMessage)
 	mux.HandleFunc("GET /gmail/v1/users/{userId}/messages/{messageId}/attachments/{attachmentId}", rt.gmailGetAttachment)
@@ -1305,19 +1307,79 @@ func (rt *Router) gmailSendMessage(w http.ResponseWriter, r *http.Request) {
 	rt.gmailExecute(w, r, "send_email", body)
 }
 
+// draftBodyFields is the allow-list of JSON keys accepted by the drafts
+// endpoint. Anything else is rejected with 400 rather than silently dropped —
+// so a caller can't think it threaded a reply (or set `raw`) when the field was
+// ignored. camelCase Gmail-style aliases are normalized to the snake_case op
+// params. `raw` is intentionally absent: the simplified draft shape can't accept
+// an opaque MIME blob (policies must see structured fields), so it 400s with a
+// pointer to the structured fields instead of creating a blank draft.
+var draftBodyFields = map[string]string{
+	"to":                     "to",
+	"cc":                     "cc",
+	"bcc":                    "bcc",
+	"subject":                "subject",
+	"body":                   "body",
+	"in_reply_to_message_id": "in_reply_to_message_id",
+	"inReplyToMessageId":     "in_reply_to_message_id",
+	"thread_id":              "thread_id",
+	"threadId":               "thread_id",
+	"in_reply_to":            "in_reply_to",
+	"inReplyTo":              "in_reply_to",
+	"references":             "references",
+	"reply_to":               "reply_to",
+}
+
 func (rt *Router) gmailCreateDraft(w http.ResponseWriter, r *http.Request) {
-	var body map[string]any
-	if r.Body != nil {
-		defer r.Body.Close()
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON body")
-			return
-		}
-	}
-	if body == nil {
-		body = map[string]any{}
+	body, ok := rt.parseDraftBody(w, r)
+	if !ok {
+		return
 	}
 	rt.gmailExecute(w, r, "create_draft", body)
+}
+
+// parseDraftBody decodes and validates a drafts request body against
+// draftBodyFields, returning the normalized op params. On any error it writes
+// the HTTP response and returns ok=false.
+func (rt *Router) parseDraftBody(w http.ResponseWriter, r *http.Request) (map[string]any, bool) {
+	var raw map[string]any
+	if r.Body != nil {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return nil, false
+		}
+	}
+	params := map[string]any{}
+	for k, v := range raw {
+		if k == "raw" {
+			writeError(w, http.StatusBadRequest,
+				"field \"raw\" is not supported: this endpoint takes structured fields (to, cc, bcc, subject, body) so policies can inspect the content. To reply into a thread, set in_reply_to_message_id.")
+			return nil, false
+		}
+		param, allowed := draftBodyFields[k]
+		if !allowed {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(
+				"unknown field %q. Accepted: to, cc, bcc, subject, body, in_reply_to_message_id, thread_id, in_reply_to, references.", k))
+			return nil, false
+		}
+		params[param] = v
+	}
+	return params, true
+}
+
+func (rt *Router) gmailListDrafts(w http.ResponseWriter, r *http.Request) {
+	params := map[string]any{}
+	if max := r.URL.Query().Get("maxResults"); max != "" {
+		params["max_results"] = max
+	}
+	rt.gmailExecute(w, r, "list_drafts", params)
+}
+
+func (rt *Router) gmailDeleteDraft(w http.ResponseWriter, r *http.Request) {
+	rt.gmailExecute(w, r, "delete_draft", map[string]any{
+		"draft_id": r.PathValue("id"),
+	})
 }
 
 func (rt *Router) gmailListLabels(w http.ResponseWriter, r *http.Request) {

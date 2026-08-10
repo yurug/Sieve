@@ -130,9 +130,58 @@ curl -X POST "http://localhost:19817/gmail/v1/users/me/drafts" \
   -H "Content-Type: application/json" \
   -d '{
     "to": ["recipient@example.com"],
+    "cc": ["team@example.com"],
+    "bcc": ["archive@example.com"],
     "subject": "Draft via Sieve",
     "body": "This is a draft."
   }'
+```
+
+Accepted body fields: `to`, `cc`, `bcc`, `subject`, `body`, and the threading
+fields below. **Unknown fields are rejected with `400`** (they are never
+silently dropped), so a typo can't leave you thinking a field took effect when
+it didn't. An opaque `raw` MIME blob is **not** accepted — the endpoint takes
+structured fields so response/pre-execution policies can inspect the content.
+
+#### Draft (or send) a reply into an existing thread
+
+To reply *into* a conversation instead of starting a new thread, set
+`in_reply_to_message_id` to the Gmail message id of the parent. Sieve looks up
+that message and fills in the `threadId`, the `In-Reply-To`/`References`
+headers, and a `Re:` subject (when you don't supply one) so the reply threads
+correctly in the recipient's client and in downstream ticketing systems:
+
+```bash
+curl -X POST "http://localhost:19817/gmail/v1/users/me/drafts" \
+  -H "Authorization: Bearer sieve_tok_xxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": ["recipient@example.com"],
+    "body": "Thanks — see attached.",
+    "in_reply_to_message_id": "18febc0f2a1b2c3d"
+  }'
+```
+
+The same `in_reply_to_message_id` field works on `messages/send` (send a reply
+directly) and `drafts` update. Advanced callers who already have the raw values
+may instead pass `thread_id`, `in_reply_to` (parent `Message-ID`), and
+`references` explicitly; these override the looked-up values.
+
+### List drafts
+
+```bash
+curl "http://localhost:19817/gmail/v1/users/me/drafts?maxResults=50" \
+  -H "Authorization: Bearer sieve_tok_xxxxx"
+```
+
+Returns lightweight stubs (draft id plus the message's id/thread_id/to/subject/
+snippet — no body), so you can find and verify drafts you created.
+
+### Delete a draft
+
+```bash
+curl -X DELETE "http://localhost:19817/gmail/v1/users/me/drafts/DRAFT_ID" \
+  -H "Authorization: Bearer sieve_tok_xxxxx"
 ```
 
 ### Modify labels (add/remove)
@@ -161,6 +210,8 @@ curl -X POST "http://localhost:19817/gmail/v1/users/me/messages/MESSAGE_ID/modif
 | GET | `/gmail/v1/users/{userId}/threads/{id}` | read_thread |
 | POST | `/gmail/v1/users/{userId}/messages/send` | send_email |
 | POST | `/gmail/v1/users/{userId}/drafts` | create_draft |
+| GET | `/gmail/v1/users/{userId}/drafts` | list_drafts |
+| DELETE | `/gmail/v1/users/{userId}/drafts/{id}` | delete_draft |
 | GET | `/gmail/v1/users/{userId}/labels` | list_labels |
 | GET | `/gmail/v1/users/{userId}/messages/{messageId}/attachments/{attachmentId}` | get_attachment |
 | POST | `/gmail/v1/users/{userId}/messages/{id}/modify` | add_label / remove_label / archive |

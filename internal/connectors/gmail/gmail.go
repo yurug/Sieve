@@ -451,13 +451,18 @@ var operations = []connector.OperationDef{
 	},
 	{
 		Name:        "create_draft",
-		Description: "Create a new email draft",
+		Description: "Create a new email draft. To draft a reply INTO an existing conversation, set in_reply_to_message_id to the parent message's id — the connector looks up the thread and Message-ID/References headers so the draft threads correctly. (thread_id / in_reply_to / references may be set explicitly instead.)",
 		Params: map[string]connector.ParamDef{
-			"to":       {Type: "[]string", Description: "Recipient email addresses", Required: false},
-			"cc":       {Type: "[]string", Description: "CC email addresses", Required: false},
-			"subject":  {Type: "string", Description: "Email subject", Required: false},
-			"body":     {Type: "string", Description: "Email body text", Required: false},
-			"reply_to": {Type: "string", Description: "Message ID to reply to", Required: false},
+			"to":                     {Type: "[]string", Description: "Recipient email addresses", Required: false},
+			"cc":                     {Type: "[]string", Description: "CC email addresses", Required: false},
+			"bcc":                    {Type: "[]string", Description: "BCC email addresses", Required: false},
+			"subject":                {Type: "string", Description: "Email subject (defaults to Re: parent subject when in_reply_to_message_id is set)", Required: false},
+			"body":                   {Type: "string", Description: "Email body text", Required: false},
+			"in_reply_to_message_id": {Type: "string", Description: "Gmail message id of the parent to reply into; the connector derives thread_id, In-Reply-To and References", Required: false},
+			"thread_id":              {Type: "string", Description: "Gmail thread id to attach the draft to (advanced; prefer in_reply_to_message_id)", Required: false},
+			"in_reply_to":            {Type: "string", Description: "Parent RFC5322 Message-ID for the In-Reply-To header (advanced)", Required: false},
+			"references":             {Type: "string", Description: "RFC5322 References chain (advanced)", Required: false},
+			"reply_to":               {Type: "string", Description: "DEPRECATED legacy alias; use in_reply_to_message_id", Required: false},
 		},
 		ReadOnly: false,
 	},
@@ -465,23 +470,33 @@ var operations = []connector.OperationDef{
 		Name:        "update_draft",
 		Description: "Update an existing email draft",
 		Params: map[string]connector.ParamDef{
-			"draft_id": {Type: "string", Description: "The ID of the draft to update", Required: true},
-			"to":       {Type: "[]string", Description: "Recipient email addresses", Required: false},
-			"cc":       {Type: "[]string", Description: "CC email addresses", Required: false},
-			"subject":  {Type: "string", Description: "Email subject", Required: false},
-			"body":     {Type: "string", Description: "Email body text", Required: false},
+			"draft_id":               {Type: "string", Description: "The ID of the draft to update", Required: true},
+			"to":                     {Type: "[]string", Description: "Recipient email addresses", Required: false},
+			"cc":                     {Type: "[]string", Description: "CC email addresses", Required: false},
+			"bcc":                    {Type: "[]string", Description: "BCC email addresses", Required: false},
+			"subject":                {Type: "string", Description: "Email subject", Required: false},
+			"body":                   {Type: "string", Description: "Email body text", Required: false},
+			"in_reply_to_message_id": {Type: "string", Description: "Gmail message id of the parent to reply into; derives thread_id, In-Reply-To and References", Required: false},
+			"thread_id":              {Type: "string", Description: "Gmail thread id to attach the draft to (advanced)", Required: false},
+			"in_reply_to":            {Type: "string", Description: "Parent RFC5322 Message-ID for the In-Reply-To header (advanced)", Required: false},
+			"references":             {Type: "string", Description: "RFC5322 References chain (advanced)", Required: false},
 		},
 		ReadOnly: false,
 	},
 	{
 		Name:        "send_email",
-		Description: "Send an email directly",
+		Description: "Send an email directly. Set in_reply_to_message_id to send a reply INTO an existing conversation (derives thread_id and threading headers).",
 		Params: map[string]connector.ParamDef{
-			"to":       {Type: "[]string", Description: "Recipient email addresses", Required: false},
-			"cc":       {Type: "[]string", Description: "CC email addresses", Required: false},
-			"subject":  {Type: "string", Description: "Email subject", Required: false},
-			"body":     {Type: "string", Description: "Email body text", Required: false},
-			"reply_to": {Type: "string", Description: "Message ID to reply to", Required: false},
+			"to":                     {Type: "[]string", Description: "Recipient email addresses", Required: false},
+			"cc":                     {Type: "[]string", Description: "CC email addresses", Required: false},
+			"bcc":                    {Type: "[]string", Description: "BCC email addresses", Required: false},
+			"subject":                {Type: "string", Description: "Email subject", Required: false},
+			"body":                   {Type: "string", Description: "Email body text", Required: false},
+			"in_reply_to_message_id": {Type: "string", Description: "Gmail message id of the parent to reply into; derives thread_id, In-Reply-To and References", Required: false},
+			"thread_id":              {Type: "string", Description: "Gmail thread id to attach the message to (advanced)", Required: false},
+			"in_reply_to":            {Type: "string", Description: "Parent RFC5322 Message-ID for the In-Reply-To header (advanced)", Required: false},
+			"references":             {Type: "string", Description: "RFC5322 References chain (advanced)", Required: false},
+			"reply_to":               {Type: "string", Description: "DEPRECATED legacy alias; use in_reply_to_message_id", Required: false},
 		},
 		ReadOnly: false,
 	},
@@ -490,6 +505,22 @@ var operations = []connector.OperationDef{
 		Description: "Send an existing draft",
 		Params: map[string]connector.ParamDef{
 			"draft_id": {Type: "string", Description: "The ID of the draft to send", Required: true},
+		},
+		ReadOnly: false,
+	},
+	{
+		Name:        "list_drafts",
+		Description: "List existing drafts as lightweight stubs (draft id + message id/thread_id/to/subject/snippet; no body). Use to find or verify drafts you created.",
+		Params: map[string]connector.ParamDef{
+			"max_results": {Type: "int", Description: "Maximum drafts to return (default 100, max 500)", Required: false},
+		},
+		ReadOnly: true,
+	},
+	{
+		Name:        "delete_draft",
+		Description: "Permanently delete a draft by id",
+		Params: map[string]connector.ParamDef{
+			"draft_id": {Type: "string", Description: "The ID of the draft to delete", Required: true},
 		},
 		ReadOnly: false,
 	},
@@ -815,9 +846,13 @@ func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[str
 		req := gmailclient.DraftRequest{
 			To:      getStringSliceParam(params, "to"),
 			Cc:      getStringSliceParam(params, "cc"),
+			Bcc:     getStringSliceParam(params, "bcc"),
 			Subject: getStringParam(params, "subject"),
 			Body:    getStringParam(params, "body"),
 			ReplyTo: getStringParam(params, "reply_to"),
+		}
+		if err := g.applyThreading(ctx, params, &req); err != nil {
+			return nil, err
 		}
 		return g.client.CreateDraft(ctx, req)
 
@@ -829,8 +864,12 @@ func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[str
 		req := gmailclient.DraftRequest{
 			To:      getStringSliceParam(params, "to"),
 			Cc:      getStringSliceParam(params, "cc"),
+			Bcc:     getStringSliceParam(params, "bcc"),
 			Subject: getStringParam(params, "subject"),
 			Body:    getStringParam(params, "body"),
+		}
+		if err := g.applyThreading(ctx, params, &req); err != nil {
+			return nil, err
 		}
 		return g.client.UpdateDraft(ctx, draftID, req)
 
@@ -838,9 +877,13 @@ func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[str
 		req := gmailclient.DraftRequest{
 			To:      getStringSliceParam(params, "to"),
 			Cc:      getStringSliceParam(params, "cc"),
+			Bcc:     getStringSliceParam(params, "bcc"),
 			Subject: getStringParam(params, "subject"),
 			Body:    getStringParam(params, "body"),
 			ReplyTo: getStringParam(params, "reply_to"),
+		}
+		if err := g.applyThreading(ctx, params, &req); err != nil {
+			return nil, err
 		}
 		return g.client.SendEmail(ctx, req)
 
@@ -850,6 +893,16 @@ func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[str
 			return nil, err
 		}
 		return g.client.SendDraft(ctx, draftID)
+
+	case "list_drafts":
+		return g.client.ListDrafts(ctx, int64(getIntParam(params, "max_results")))
+
+	case "delete_draft":
+		draftID, err := requireStringParam(params, "draft_id")
+		if err != nil {
+			return nil, err
+		}
+		return nil, g.client.DeleteDraft(ctx, draftID)
 
 	case "add_label":
 		messageID, err := requireStringParam(params, "message_id")
@@ -891,9 +944,15 @@ func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[str
 		req := gmailclient.DraftRequest{
 			To:      getStringSliceParam(params, "to"),
 			Cc:      getStringSliceParam(params, "cc"),
+			Bcc:     getStringSliceParam(params, "bcc"),
 			Subject: getStringParam(params, "subject"),
 			Body:    getStringParam(params, "body"),
-			ReplyTo: messageID,
+		}
+		// Reply threads into message_id's conversation with correct thread_id +
+		// In-Reply-To/References headers (derived from the parent), instead of the
+		// old behavior that mis-used the message id as both threadId and Message-ID.
+		if err := g.applyThreadingFromParent(ctx, messageID, &req); err != nil {
+			return nil, err
 		}
 		return g.client.SendEmail(ctx, req)
 
@@ -1141,6 +1200,57 @@ func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[str
 	default:
 		return nil, fmt.Errorf("google connector: unknown operation %q", op)
 	}
+}
+
+// applyThreading populates the threading fields of req from params. Explicit
+// advanced fields (thread_id / in_reply_to / references) win; otherwise, if
+// in_reply_to_message_id is set, the parent message is looked up and its
+// thread_id, Message-ID, References and (when subject is empty) a "Re:" subject
+// are filled in. Returns an error only when the parent lookup fails.
+func (g *GoogleConnector) applyThreading(ctx context.Context, params map[string]any, req *gmailclient.DraftRequest) error {
+	req.ThreadID = getStringParam(params, "thread_id")
+	req.InReplyTo = getStringParam(params, "in_reply_to")
+	req.References = getStringParam(params, "references")
+
+	parentID := getStringParam(params, "in_reply_to_message_id")
+	if parentID == "" {
+		return nil
+	}
+	return g.applyThreadingFromParent(ctx, parentID, req)
+}
+
+// applyThreadingFromParent looks up parentID and fills any threading field of
+// req not already set: thread_id, In-Reply-To (parent Message-ID), References,
+// and a "Re:" subject when none was supplied.
+func (g *GoogleConnector) applyThreadingFromParent(ctx context.Context, parentID string, req *gmailclient.DraftRequest) error {
+	rc, err := g.client.GetReplyContext(ctx, parentID)
+	if err != nil {
+		return err
+	}
+	if req.ThreadID == "" {
+		req.ThreadID = rc.ThreadID
+	}
+	if req.InReplyTo == "" {
+		req.InReplyTo = rc.MessageID
+	}
+	if req.References == "" {
+		req.References = rc.References
+	}
+	if req.Subject == "" && rc.Subject != "" {
+		req.Subject = ensureRePrefix(rc.Subject)
+	}
+	return nil
+}
+
+// ensureRePrefix prepends "Re: " unless the subject already starts with a
+// case-insensitive "Re:" (with or without trailing space), so replies don't
+// accumulate "Re: Re: ...".
+func ensureRePrefix(subject string) string {
+	trimmed := strings.TrimSpace(subject)
+	if len(trimmed) >= 3 && strings.EqualFold(trimmed[:3], "re:") {
+		return subject
+	}
+	return "Re: " + subject
 }
 
 // Validate checks that the credentials are valid by listing 1 email.
