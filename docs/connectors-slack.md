@@ -14,7 +14,8 @@ This page covers the operator setup.
 | `read_channel_history` | Read recent messages from a channel. | `channels:history`, `groups:history` |
 | `read_thread` | Read replies under a parent message. | `channels:history`, `groups:history` |
 | `search_messages` | Search workspace messages. **User-token connections only** — bot connections return `operation_not_enabled` (see Two identities). | `search:read` (user scope) |
-| `post_message` | Post a message to a channel. | `chat:write` |
+| `post_message` | Post a message to a channel. Set `thread_ts` to reply inside a thread; `blocks`/`attachments` for rich formatting. | `chat:write` |
+| `slack_request` | Escape hatch: call any Slack Web API method directly (`api_method` + `params`). For anything the curated ops don't model. Still IAM-gated. | depends on the method called |
 
 All `list_*` operations (and `search_messages`) follow Sieve's normalized `{items, next_cursor}` pagination shape. Agents pass `cursor` and `page_size` (default 100, max 100) into the next call to walk past the first page.
 

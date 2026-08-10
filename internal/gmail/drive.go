@@ -190,21 +190,46 @@ func (c *DriveClient) UploadFile(ctx context.Context, name string, content strin
 	}, nil
 }
 
-// ShareFile shares a file with a user by email.
-func (c *DriveClient) ShareFile(ctx context.Context, fileID string, email string, role string) (map[string]any, error) {
+// ShareSpec parameterises a Drive permission grant. shareType is one of
+// user/group/domain/anyone (default user); email applies to user/group, domain
+// to domain; sendNotification controls the "shared with you" email (Google
+// forces it on for user/group unless explicitly disabled).
+type ShareSpec struct {
+	Email            string
+	Role             string
+	Type             string
+	Domain           string
+	SendNotification bool
+}
+
+// ShareFile grants a Drive permission. Previously it hardcoded type=user and
+// sendNotificationEmail=true; both are now caller-controlled so an operator can
+// share with a domain / "anyone", or suppress the notification email.
+func (c *DriveClient) ShareFile(ctx context.Context, fileID string, spec ShareSpec) (map[string]any, error) {
+	role := spec.Role
 	if role == "" {
 		role = "reader"
 	}
+	shareType := spec.Type
+	if shareType == "" {
+		shareType = "user"
+	}
 
-	perm := &drive.Permission{
-		Type:         "user",
-		Role:         role,
-		EmailAddress: email,
+	perm := &drive.Permission{Type: shareType, Role: role}
+	switch shareType {
+	case "user", "group":
+		perm.EmailAddress = spec.Email
+	case "domain":
+		perm.Domain = spec.Domain
+	case "anyone":
+		// no principal
+	default:
+		return nil, fmt.Errorf("drive: invalid share type %q (want user|group|domain|anyone)", shareType)
 	}
 
 	created, err := c.service.Permissions.Create(fileID, perm).
 		Context(ctx).
-		SendNotificationEmail(true).
+		SendNotificationEmail(spec.SendNotification).
 		Do()
 	if err != nil {
 		return nil, fmt.Errorf("drive: sharing file %s: %w", fileID, err)
@@ -214,6 +239,6 @@ func (c *DriveClient) ShareFile(ctx context.Context, fileID string, email string
 		"permission_id": created.Id,
 		"role":          created.Role,
 		"type":          created.Type,
-		"email":         email,
+		"email":         spec.Email,
 	}, nil
 }

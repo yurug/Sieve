@@ -86,6 +86,33 @@ func TestCreateDraft_InReplyToMessageID(t *testing.T) {
 	}
 }
 
+func TestContactName(t *testing.T) {
+	cases := []struct {
+		name, given, family   string
+		wantGiven, wantFamily string
+	}{
+		{name: "Jane Doe", wantGiven: "Jane", wantFamily: "Doe"},
+		{name: "Cher", wantGiven: "Cher", wantFamily: ""},
+		{name: "Jane Van Der Berg", wantGiven: "Jane", wantFamily: "Van Der Berg"},
+		{name: "", wantGiven: "", wantFamily: ""},
+		// Explicit parts win over the full name.
+		{name: "ignored me", given: "First", family: "Last", wantGiven: "First", wantFamily: "Last"},
+	}
+	for _, tc := range cases {
+		params := map[string]any{"name": tc.name}
+		if tc.given != "" {
+			params["given_name"] = tc.given
+		}
+		if tc.family != "" {
+			params["family_name"] = tc.family
+		}
+		g, f := contactName(params)
+		if g != tc.wantGiven || f != tc.wantFamily {
+			t.Errorf("contactName(%+v) = (%q,%q), want (%q,%q)", params, g, f, tc.wantGiven, tc.wantFamily)
+		}
+	}
+}
+
 func TestEnsureRePrefix(t *testing.T) {
 	cases := map[string]string{
 		"invoice":     "Re: invoice",

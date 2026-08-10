@@ -92,12 +92,23 @@ func (c *PeopleClient) GetContact(ctx context.Context, resourceName string) (*Co
 	return &contact, nil
 }
 
-// CreateContact creates a new contact.
-func (c *PeopleClient) CreateContact(ctx context.Context, name, email, phone string) (*Contact, error) {
+// nameField builds a People API Name from separate given/family parts, or nil
+// if both are empty. Setting GivenName + FamilyName (rather than dumping a whole
+// display name into GivenName) is what makes "Jane Doe" store as given "Jane",
+// family "Doe" — Google derives DisplayName from the parts.
+func nameField(given, family string) *people.Name {
+	if given == "" && family == "" {
+		return nil
+	}
+	return &people.Name{GivenName: given, FamilyName: family}
+}
+
+// CreateContact creates a new contact from given/family name parts.
+func (c *PeopleClient) CreateContact(ctx context.Context, given, family, email, phone string) (*Contact, error) {
 	person := &people.Person{}
 
-	if name != "" {
-		person.Names = []*people.Name{{GivenName: name}}
+	if n := nameField(given, family); n != nil {
+		person.Names = []*people.Name{n}
 	}
 	if email != "" {
 		person.EmailAddresses = []*people.EmailAddress{{Value: email}}
@@ -115,8 +126,8 @@ func (c *PeopleClient) CreateContact(ctx context.Context, name, email, phone str
 	return &contact, nil
 }
 
-// UpdateContact updates an existing contact.
-func (c *PeopleClient) UpdateContact(ctx context.Context, resourceName string, name, email, phone string) (*Contact, error) {
+// UpdateContact updates an existing contact from given/family name parts.
+func (c *PeopleClient) UpdateContact(ctx context.Context, resourceName string, given, family, email, phone string) (*Contact, error) {
 	// First get the current person to obtain the etag.
 	existing, err := c.service.People.Get(resourceName).Context(ctx).
 		PersonFields("names,emailAddresses,phoneNumbers").Do()
@@ -129,8 +140,8 @@ func (c *PeopleClient) UpdateContact(ctx context.Context, resourceName string, n
 	}
 
 	var updateFields []string
-	if name != "" {
-		person.Names = []*people.Name{{GivenName: name}}
+	if n := nameField(given, family); n != nil {
+		person.Names = []*people.Name{n}
 		updateFields = append(updateFields, "names")
 	}
 	if email != "" {

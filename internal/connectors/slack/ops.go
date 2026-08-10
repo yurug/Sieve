@@ -83,6 +83,19 @@ var operations = []connector.OperationDef{
 			"attachments": {Type: "json", Description: "Legacy attachments (JSON array); Slack chat.postMessage `attachments`."},
 		},
 	},
+	{
+		// Escape hatch: reach any Slack Web API method the curated ops don't
+		// model, so a missing field is never a dead end. Still IAM-gated
+		// (slack/write). Mirrors github_request / gitlab_request / etc.
+		Name:        "slack_request",
+		Description: "Call any Slack Web API method directly. `api_method` is the method name (e.g. \"conversations.list\", \"chat.postMessage\"); `params` is an object of that method's arguments (nested objects/arrays are JSON-encoded). `http_method` defaults to POST.",
+		ReadOnly:    false,
+		Params: map[string]connector.ParamDef{
+			"api_method":  {Type: "string", Required: true, Description: "Slack Web API method, e.g. conversations.list"},
+			"params":      {Type: "json", Description: "Arguments object for the method"},
+			"http_method": {Type: "string", Description: "GET or POST (default POST)"},
+		},
+	},
 }
 
 // execute dispatches to the per-op implementation. Unknown operations
@@ -104,6 +117,8 @@ func (c *Connector) execute(ctx context.Context, op string, params map[string]an
 		return c.opSearchMessages(ctx, params)
 	case "post_message":
 		return c.opPostMessage(ctx, params)
+	case "slack_request":
+		return c.opSlackRequest(ctx, params)
 	default:
 		return nil, fmt.Errorf("slack: unknown operation %q", op)
 	}
@@ -316,6 +331,44 @@ func (c *Connector) opPostMessage(ctx context.Context, params map[string]any) (a
 		return nil, err
 	}
 	return resp, nil
+}
+
+// opSlackRequest forwards a call to an arbitrary Slack Web API method. It's the
+// generic escape hatch so an agent isn't blocked when a curated op doesn't model
+// a field. Each entry in `params` becomes a form value (nested objects/arrays
+// JSON-encoded, matching how Slack accepts blocks/attachments).
+func (c *Connector) opSlackRequest(ctx context.Context, params map[string]any) (any, error) {
+	method, _ := params["api_method"].(string)
+	method = strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(method), "/"), "api/")
+	if method == "" {
+		return nil, fmt.Errorf("slack: slack_request requires api_method (e.g. \"conversations.list\")")
+	}
+
+	v := url.Values{}
+	if args, ok := params["params"].(map[string]any); ok {
+		for k, val := range args {
+			switch x := val.(type) {
+			case nil:
+				// skip
+			case string:
+				v.Set(k, x)
+			case bool:
+				v.Set(k, strconv.FormatBool(x))
+			default:
+				b, err := json.Marshal(x)
+				if err != nil {
+					return nil, fmt.Errorf("slack: slack_request param %q must be JSON-serialisable: %w", k, err)
+				}
+				v.Set(k, string(b))
+			}
+		}
+	}
+
+	httpMethod, _ := params["http_method"].(string)
+	if strings.EqualFold(strings.TrimSpace(httpMethod), "GET") {
+		return c.client.get(ctx, method, v)
+	}
+	return c.client.post(ctx, method, v)
 }
 
 // jsonParam coerces a param to a JSON-encoded string for Slack form fields that

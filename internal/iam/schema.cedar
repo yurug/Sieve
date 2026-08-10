@@ -296,7 +296,7 @@ namespace Sieve {
   action "google/drive.share_file" in ["google/drive.write"] appliesTo {
     principal: [Sieve::Token],
     resource: [Sieve::Connection],
-    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "email"?: String, "file_id"?: String, "role"?: String } }
+    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "domain"?: String, "email"?: String, "file_id"?: String, "role"?: String, "send_notification"?: Bool, "type"?: String } }
   };
   action "google/drive.upload_file" in ["google/drive.write"] appliesTo {
     principal: [Sieve::Token],
@@ -326,7 +326,7 @@ namespace Sieve {
   action "google/people.create_contact" in ["google/people.write"] appliesTo {
     principal: [Sieve::Token],
     resource: [Sieve::Connection],
-    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "email"?: String, "name"?: String, "phone"?: String } }
+    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "email"?: String, "family_name"?: String, "given_name"?: String, "name"?: String, "phone"?: String } }
   };
   action "google/people.delete_contact" in ["google/people.write"] appliesTo {
     principal: [Sieve::Token],
@@ -346,7 +346,7 @@ namespace Sieve {
   action "google/people.update_contact" in ["google/people.write"] appliesTo {
     principal: [Sieve::Token],
     resource: [Sieve::Connection],
-    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "email"?: String, "name"?: String, "phone"?: String, "resource_name"?: String } }
+    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "email"?: String, "family_name"?: String, "given_name"?: String, "name"?: String, "phone"?: String, "resource_name"?: String } }
   };
   action "google/read_email" in ["google/gmail.read"] appliesTo {
     principal: [Sieve::Token],
@@ -562,6 +562,11 @@ namespace Sieve {
     principal: [Sieve::Token],
     resource: [Sieve::Connection],
     context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "cursor"?: String, "page_size"?: Long, "query"?: String } }
+  };
+  action "slack/slack_request" in ["slack/write"] appliesTo {
+    principal: [Sieve::Token],
+    resource: [Sieve::Connection],
+    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "api_method"?: String, "http_method"?: String, "params"?: String } }
   };
 }
 

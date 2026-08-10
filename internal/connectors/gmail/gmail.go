@@ -620,11 +620,14 @@ var operations = []connector.OperationDef{
 	},
 	{
 		Name:        "drive.share_file",
-		Description: "Share a file with a user by email",
+		Description: "Share a file. Defaults to sharing with a user by email and sending a notification; set type/domain/send_notification for other grants.",
 		Params: map[string]connector.ParamDef{
-			"file_id": {Type: "string", Description: "The ID of the file to share", Required: true},
-			"email":   {Type: "string", Description: "Email address to share with", Required: true},
-			"role":    {Type: "string", Description: "Permission role: reader, writer, commenter (default: reader)", Required: false},
+			"file_id":           {Type: "string", Description: "The ID of the file to share", Required: true},
+			"email":             {Type: "string", Description: "Email to share with (required for type user/group)", Required: false},
+			"role":              {Type: "string", Description: "Permission role: reader, writer, commenter (default: reader)", Required: false},
+			"type":              {Type: "string", Description: "Grantee type: user, group, domain, anyone (default: user)", Required: false},
+			"domain":            {Type: "string", Description: "Domain to share with (required for type domain)", Required: false},
+			"send_notification": {Type: "bool", Description: "Send the 'shared with you' email (default true)", Required: false},
 		},
 		ReadOnly: false,
 	},
@@ -671,12 +674,12 @@ var operations = []connector.OperationDef{
 		Params: map[string]connector.ParamDef{
 			"calendar_id": {Type: "string", Description: "Calendar ID (default: primary)", Required: false},
 			"event_id":    {Type: "string", Description: "The event ID", Required: true},
-			"summary":     {Type: "string", Description: "Event title", Required: false},
+			"summary":     {Type: "string", Description: "Event title (omit to leave unchanged; empty string to clear)", Required: false},
 			"start":       {Type: "string", Description: "Start time (RFC3339)", Required: false},
 			"end":         {Type: "string", Description: "End time (RFC3339)", Required: false},
-			"location":    {Type: "string", Description: "Event location", Required: false},
-			"description": {Type: "string", Description: "Event description", Required: false},
-			"attendees":   {Type: "[]string", Description: "Attendee email addresses", Required: false},
+			"location":    {Type: "string", Description: "Event location (omit to leave unchanged; empty string to clear)", Required: false},
+			"description": {Type: "string", Description: "Event description (omit to leave unchanged; empty string to clear)", Required: false},
+			"attendees":   {Type: "[]string", Description: "REPLACES the whole attendee list (include existing addresses when adding; empty clears all)", Required: false},
 		},
 		ReadOnly: false,
 	},
@@ -710,20 +713,24 @@ var operations = []connector.OperationDef{
 	},
 	{
 		Name:        "people.create_contact",
-		Description: "Create a new contact",
+		Description: "Create a new contact. Use given_name/family_name for precise name parts, or name for a full name (split on whitespace).",
 		Params: map[string]connector.ParamDef{
-			"name":  {Type: "string", Description: "Contact name", Required: false},
-			"email": {Type: "string", Description: "Contact email address", Required: false},
-			"phone": {Type: "string", Description: "Contact phone number", Required: false},
+			"name":        {Type: "string", Description: "Full name; split into given/family on whitespace (ignored if given_name/family_name set)", Required: false},
+			"given_name":  {Type: "string", Description: "Given (first) name", Required: false},
+			"family_name": {Type: "string", Description: "Family (last) name", Required: false},
+			"email":       {Type: "string", Description: "Contact email address", Required: false},
+			"phone":       {Type: "string", Description: "Contact phone number", Required: false},
 		},
 		ReadOnly: false,
 	},
 	{
 		Name:        "people.update_contact",
-		Description: "Update an existing contact",
+		Description: "Update an existing contact. Use given_name/family_name for precise name parts, or name for a full name (split on whitespace).",
 		Params: map[string]connector.ParamDef{
 			"resource_name": {Type: "string", Description: "Resource name (e.g. people/c12345)", Required: true},
-			"name":          {Type: "string", Description: "Contact name", Required: false},
+			"name":          {Type: "string", Description: "Full name; split into given/family on whitespace (ignored if given_name/family_name set)", Required: false},
+			"given_name":    {Type: "string", Description: "Given (first) name", Required: false},
+			"family_name":   {Type: "string", Description: "Family (last) name", Required: false},
 			"email":         {Type: "string", Description: "Contact email address", Required: false},
 			"phone":         {Type: "string", Description: "Contact phone number", Required: false},
 		},
@@ -1014,12 +1021,25 @@ func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[str
 		if err != nil {
 			return nil, err
 		}
-		email, err := requireStringParam(params, "email")
-		if err != nil {
-			return nil, err
+		shareType := getStringParam(params, "type")
+		spec := gmailclient.ShareSpec{
+			Email:            getStringParam(params, "email"),
+			Role:             getStringParam(params, "role"),
+			Type:             shareType,
+			Domain:           getStringParam(params, "domain"),
+			SendNotification: true, // Drive default; overridable below.
 		}
-		role := getStringParam(params, "role")
-		return g.driveClient.ShareFile(ctx, fileID, email, role)
+		if hasParam(params, "send_notification") {
+			spec.SendNotification = getBoolParam(params, "send_notification")
+		}
+		// email is required for the user/group grant types (the common case).
+		if (shareType == "" || shareType == "user" || shareType == "group") && spec.Email == "" {
+			return nil, fmt.Errorf("gmail connector: missing required parameter %q", "email")
+		}
+		if shareType == "domain" && spec.Domain == "" {
+			return nil, fmt.Errorf("gmail connector: share type \"domain\" requires %q", "domain")
+		}
+		return g.driveClient.ShareFile(ctx, fileID, spec)
 
 	// --- Google Calendar ---
 	case "calendar.list_events":
@@ -1066,16 +1086,24 @@ func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[str
 		if err != nil {
 			return nil, err
 		}
-		return g.calendarClient.UpdateEvent(ctx,
-			getStringParam(params, "calendar_id"),
-			eventID,
-			getStringParam(params, "summary"),
-			getStringParam(params, "location"),
-			getStringParam(params, "description"),
-			getStringParam(params, "start"),
-			getStringParam(params, "end"),
-			getStringSliceParam(params, "attendees"),
-		)
+		// Presence-aware: a field only changes when the caller included it, and
+		// an explicit "" clears it (see EventPatch). attendees, when present,
+		// replaces the whole list.
+		patch := gmailclient.EventPatch{
+			Summary:     getStringPtrParam(params, "summary"),
+			Location:    getStringPtrParam(params, "location"),
+			Description: getStringPtrParam(params, "description"),
+			StartTime:   getStringPtrParam(params, "start"),
+			EndTime:     getStringPtrParam(params, "end"),
+		}
+		if hasParam(params, "attendees") {
+			a := getStringSliceParam(params, "attendees")
+			if a == nil {
+				a = []string{}
+			}
+			patch.Attendees = &a
+		}
+		return g.calendarClient.UpdateEvent(ctx, getStringParam(params, "calendar_id"), eventID, patch)
 
 	case "calendar.delete_event":
 		eventID, err := requireStringParam(params, "event_id")
@@ -1099,8 +1127,9 @@ func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[str
 		return g.peopleClient.GetContact(ctx, resourceName)
 
 	case "people.create_contact":
+		given, family := contactName(params)
 		return g.peopleClient.CreateContact(ctx,
-			getStringParam(params, "name"),
+			given, family,
 			getStringParam(params, "email"),
 			getStringParam(params, "phone"),
 		)
@@ -1110,9 +1139,10 @@ func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[str
 		if err != nil {
 			return nil, err
 		}
+		given, family := contactName(params)
 		return g.peopleClient.UpdateContact(ctx,
 			resourceName,
-			getStringParam(params, "name"),
+			given, family,
 			getStringParam(params, "email"),
 			getStringParam(params, "phone"),
 		)
@@ -1282,6 +1312,46 @@ func requireStringParam(params map[string]any, key string) (string, error) {
 		return "", fmt.Errorf("gmail connector: missing required parameter %q", key)
 	}
 	return v, nil
+}
+
+// contactName resolves a contact's given/family name from params. Explicit
+// given_name/family_name win; otherwise a single `name` is split on the last
+// run of whitespace (first token → given, remainder → family) so "Jane Doe"
+// stores as given "Jane", family "Doe" instead of the whole string in given.
+func contactName(params map[string]any) (given, family string) {
+	given = getStringParam(params, "given_name")
+	family = getStringParam(params, "family_name")
+	if given != "" || family != "" {
+		return given, family
+	}
+	fields := strings.Fields(getStringParam(params, "name"))
+	switch len(fields) {
+	case 0:
+		return "", ""
+	case 1:
+		return fields[0], ""
+	default:
+		return fields[0], strings.Join(fields[1:], " ")
+	}
+}
+
+// hasParam reports whether key is present in params at all (even if empty/null),
+// used to distinguish "field omitted" from "field set to empty" on PATCH-style
+// updates.
+func hasParam(params map[string]any, key string) bool {
+	_, ok := params[key]
+	return ok
+}
+
+// getStringPtrParam returns a pointer to the string value when key is present
+// (empty string included), or nil when the key is absent. Lets a caller send an
+// explicit "" to clear a field vs omit it to leave it unchanged.
+func getStringPtrParam(params map[string]any, key string) *string {
+	if v, ok := params[key]; ok {
+		s, _ := v.(string)
+		return &s
+	}
+	return nil
 }
 
 func getIntParam(params map[string]any, key string) int {

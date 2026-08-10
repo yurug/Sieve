@@ -363,6 +363,52 @@ func TestOps_PostMessage_Threading(t *testing.T) {
 	}
 }
 
+func TestOps_SlackRequest_ForwardsMethodAndParams(t *testing.T) {
+	mock := mockslack.New()
+	t.Cleanup(mock.Close)
+	c, _ := newConnectorForTest(t, mock)
+
+	_, err := c.Execute(context.Background(), "slack_request", map[string]any{
+		"api_method": "conversations.history",
+		"params": map[string]any{
+			"channel":   "C123",
+			"inclusive": true,                              // bool → "true"
+			"metadata":  map[string]any{"event_type": "x"}, // nested → JSON-encoded
+		},
+	})
+	if err != nil {
+		t.Fatalf("slack_request: %v", err)
+	}
+	var form map[string][]string
+	var path string
+	for _, call := range mock.Calls() {
+		if strings.Contains(call.Path, "conversations.history") {
+			path, form = call.Path, call.Form
+		}
+	}
+	if path == "" {
+		t.Fatal("slack_request did not reach conversations.history")
+	}
+	if got := form["channel"]; len(got) == 0 || got[0] != "C123" {
+		t.Errorf("channel = %v, want C123 forwarded", got)
+	}
+	if got := form["inclusive"]; len(got) == 0 || got[0] != "true" {
+		t.Errorf("inclusive = %v, want bool encoded as \"true\"", got)
+	}
+	if got := form["metadata"]; len(got) == 0 || !strings.Contains(got[0], `"event_type":"x"`) {
+		t.Errorf("metadata = %v, want nested value JSON-encoded", got)
+	}
+}
+
+func TestOps_SlackRequest_RequiresMethod(t *testing.T) {
+	mock := mockslack.New()
+	t.Cleanup(mock.Close)
+	c, _ := newConnectorForTest(t, mock)
+	if _, err := c.Execute(context.Background(), "slack_request", map[string]any{}); err == nil {
+		t.Fatal("slack_request without api_method should error")
+	}
+}
+
 func TestOps_PostMessage_RequiresFields(t *testing.T) {
 	mock := mockslack.New()
 	t.Cleanup(mock.Close)
@@ -409,9 +455,10 @@ func TestOps_TerminalAuthFiresCallback(t *testing.T) {
 	}
 }
 
-// TestOps_TableMatchesContract — defensive: the curated set must
-// exactly match the seven operations listed in contracts/slack.md so a
-// reorder or rename is caught at unit-test time before policies break.
+// TestOps_TableMatchesContract — defensive: the operation set must exactly
+// match the curated ops listed in contracts/slack.md plus the slack_request
+// escape hatch, so a reorder or rename is caught at unit-test time before
+// policies break.
 func TestOps_TableMatchesContract(t *testing.T) {
 	want := map[string]bool{
 		"list_channels":        false,
@@ -421,6 +468,7 @@ func TestOps_TableMatchesContract(t *testing.T) {
 		"read_thread":          false,
 		"search_messages":      false,
 		"post_message":         false,
+		"slack_request":        false, // generic escape hatch
 	}
 	mock := mockslack.New()
 	t.Cleanup(mock.Close)

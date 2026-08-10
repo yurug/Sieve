@@ -152,32 +152,70 @@ func (c *CalendarClient) CreateEvent(ctx context.Context, calendarID string, sum
 }
 
 // UpdateEvent updates an existing calendar event using PATCH semantics.
-func (c *CalendarClient) UpdateEvent(ctx context.Context, calendarID, eventID string, summary, location, description, startTime, endTime string, attendees []string) (*CalendarEvent, error) {
+// EventPatch carries presence-aware fields for UpdateEvent. A nil pointer means
+// "leave this field unchanged"; a non-nil pointer — INCLUDING an empty string —
+// means "set it to this value". That distinction is what lets a caller clear a
+// field: passing an explicit "" for location/description blanks it (via
+// ForceSendFields) instead of being silently ignored, which the old
+// `if x != ""` guards did.
+type EventPatch struct {
+	Summary     *string
+	Location    *string
+	Description *string
+	StartTime   *string
+	EndTime     *string
+	// Attendees nil = leave unchanged; non-nil = REPLACE the whole attendee list
+	// (Google's PATCH semantics — the API has no add/remove). An empty non-nil
+	// slice clears all attendees. Callers adding one attendee must include the
+	// existing ones, or they will be dropped.
+	Attendees *[]string
+}
+
+func (c *CalendarClient) UpdateEvent(ctx context.Context, calendarID, eventID string, patch EventPatch) (*CalendarEvent, error) {
 	if calendarID == "" {
 		calendarID = "primary"
 	}
 
 	event := &calendar.Event{}
-	if summary != "" {
-		event.Summary = summary
-	}
-	if location != "" {
-		event.Location = location
-	}
-	if description != "" {
-		event.Description = description
-	}
-	if startTime != "" {
-		event.Start = &calendar.EventDateTime{DateTime: startTime}
-	}
-	if endTime != "" {
-		event.End = &calendar.EventDateTime{DateTime: endTime}
-	}
-	if len(attendees) > 0 {
-		for _, email := range attendees {
-			event.Attendees = append(event.Attendees, &calendar.EventAttendee{Email: email})
+	// force names the API fields we send even when empty, so an explicit blank
+	// clears them rather than being omitted (Google treats omitted as unchanged).
+	var force []string
+	if patch.Summary != nil {
+		event.Summary = *patch.Summary
+		if *patch.Summary == "" {
+			force = append(force, "Summary")
 		}
 	}
+	if patch.Location != nil {
+		event.Location = *patch.Location
+		if *patch.Location == "" {
+			force = append(force, "Location")
+		}
+	}
+	if patch.Description != nil {
+		event.Description = *patch.Description
+		if *patch.Description == "" {
+			force = append(force, "Description")
+		}
+	}
+	// Start/End can't be blanked (an event must have both), so an empty value is
+	// treated as "leave unchanged".
+	if patch.StartTime != nil && *patch.StartTime != "" {
+		event.Start = &calendar.EventDateTime{DateTime: *patch.StartTime}
+	}
+	if patch.EndTime != nil && *patch.EndTime != "" {
+		event.End = &calendar.EventDateTime{DateTime: *patch.EndTime}
+	}
+	if patch.Attendees != nil {
+		event.Attendees = make([]*calendar.EventAttendee, 0, len(*patch.Attendees))
+		for _, email := range *patch.Attendees {
+			event.Attendees = append(event.Attendees, &calendar.EventAttendee{Email: email})
+		}
+		if len(*patch.Attendees) == 0 {
+			force = append(force, "Attendees")
+		}
+	}
+	event.ForceSendFields = force
 
 	updated, err := c.service.Events.Patch(calendarID, eventID, event).Context(ctx).Do()
 	if err != nil {
