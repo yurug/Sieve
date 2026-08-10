@@ -330,6 +330,39 @@ func TestOps_PostMessage(t *testing.T) {
 	}
 }
 
+func TestOps_PostMessage_Threading(t *testing.T) {
+	mock := mockslack.New()
+	t.Cleanup(mock.Close)
+	c, _ := newConnectorForTest(t, mock)
+
+	_, err := c.Execute(context.Background(), "post_message", map[string]any{
+		"channel":   "bot-test",
+		"text":      "in-thread reply",
+		"thread_ts": "1700000000.000100",
+		"blocks":    []any{map[string]any{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": "hi"}}},
+	})
+	if err != nil {
+		t.Fatalf("post_message: %v", err)
+	}
+	var form map[string][]string
+	for _, call := range mock.Calls() {
+		if call.Path == "/api/chat.postMessage" {
+			form = call.Form
+		}
+	}
+	if form == nil {
+		t.Fatal("chat.postMessage was not invoked")
+	}
+	// thread_ts must reach Slack (else the reply posts as a new top-level message).
+	if got := form["thread_ts"]; len(got) == 0 || got[0] != "1700000000.000100" {
+		t.Errorf("thread_ts = %v, want it forwarded so the message threads", got)
+	}
+	// blocks must be JSON-encoded into the form field.
+	if got := form["blocks"]; len(got) == 0 || !strings.Contains(got[0], `"type":"section"`) {
+		t.Errorf("blocks = %v, want JSON-encoded Block Kit", got)
+	}
+}
+
 func TestOps_PostMessage_RequiresFields(t *testing.T) {
 	mock := mockslack.New()
 	t.Cleanup(mock.Close)

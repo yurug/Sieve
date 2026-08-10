@@ -316,7 +316,7 @@ namespace Sieve {
   action "google/list_emails" in ["google/gmail.read"] appliesTo {
     principal: [Sieve::Token],
     resource: [Sieve::Connection],
-    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "max_results"?: Long, "page_token"?: String, "query"?: String } }
+    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "include_spam_trash"?: Bool, "label_ids"?: Set<String>, "max_results"?: Long, "page_token"?: String, "query"?: String } }
   };
   action "google/list_labels" in ["google/gmail.read"] appliesTo {
     principal: [Sieve::Token],
@@ -411,7 +411,7 @@ namespace Sieve {
   action "http_proxy/proxy_request" in ["http_proxy/write"] appliesTo {
     principal: [Sieve::Token],
     resource: [Sieve::Connection],
-    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "body"?: String, "method"?: String, "path"?: String } }
+    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "body"?: String, "content_type"?: String, "headers"?: String, "method"?: String, "path"?: String } }
   };
   action "linear/linear_create_comment" in ["linear/write"] appliesTo {
     principal: [Sieve::Token],
@@ -541,7 +541,7 @@ namespace Sieve {
   action "slack/post_message" in ["slack/write"] appliesTo {
     principal: [Sieve::Token],
     resource: [Sieve::Connection],
-    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "channel"?: String, "text"?: String } }
+    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "attachments"?: String, "blocks"?: String, "channel"?: String, "text"?: String, "thread_ts"?: String } }
   };
   action "slack/read_channel_history" in ["slack/read"] appliesTo {
     principal: [Sieve::Token],

@@ -1267,6 +1267,15 @@ func (rt *Router) gmailListMessages(w http.ResponseWriter, r *http.Request) {
 	if pt := r.URL.Query().Get("pageToken"); pt != "" {
 		params["page_token"] = pt
 	}
+	// labelIds is a repeated query param in the real Gmail API; restricts
+	// results to messages carrying every listed label. Previously dropped, so a
+	// label-filtered request silently returned the unfiltered superset.
+	if labels := r.URL.Query()["labelIds"]; len(labels) > 0 {
+		params["label_ids"] = labels
+	}
+	if r.URL.Query().Get("includeSpamTrash") != "" {
+		params["include_spam_trash"] = r.URL.Query().Get("includeSpamTrash")
+	}
 	rt.gmailExecute(w, r, "list_emails", params)
 }
 
@@ -1293,28 +1302,26 @@ func (rt *Router) gmailGetThread(w http.ResponseWriter, r *http.Request) {
 }
 
 func (rt *Router) gmailSendMessage(w http.ResponseWriter, r *http.Request) {
-	var body map[string]any
-	if r.Body != nil {
-		defer r.Body.Close()
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON body")
-			return
-		}
-	}
-	if body == nil {
-		body = map[string]any{}
+	// Same structured body + threading semantics as drafts (they share the op's
+	// DraftRequest). Route through the same allow-list so send doesn't silently
+	// drop `raw` (→ blank/failed send) or camelCase threadId (→ a reply that
+	// starts a new thread) — the exact bugs the drafts path already rejects.
+	body, ok := rt.parseMailBody(w, r)
+	if !ok {
+		return
 	}
 	rt.gmailExecute(w, r, "send_email", body)
 }
 
-// draftBodyFields is the allow-list of JSON keys accepted by the drafts
-// endpoint. Anything else is rejected with 400 rather than silently dropped —
-// so a caller can't think it threaded a reply (or set `raw`) when the field was
-// ignored. camelCase Gmail-style aliases are normalized to the snake_case op
-// params. `raw` is intentionally absent: the simplified draft shape can't accept
-// an opaque MIME blob (policies must see structured fields), so it 400s with a
-// pointer to the structured fields instead of creating a blank draft.
-var draftBodyFields = map[string]string{
+// mailBodyFields is the allow-list of JSON keys accepted by the endpoints that
+// compose an outgoing message — drafts AND messages/send (they share the same
+// op DraftRequest). Anything else is rejected with 400 rather than silently
+// dropped, so a caller can't think it threaded a reply (or set `raw`) when the
+// field was ignored. camelCase Gmail-style aliases are normalized to the
+// snake_case op params. `raw` is intentionally absent: the simplified shape
+// can't accept an opaque MIME blob (policies must see structured fields), so it
+// 400s with a pointer to the structured fields instead of composing a blank one.
+var mailBodyFields = map[string]string{
 	"to":                     "to",
 	"cc":                     "cc",
 	"bcc":                    "bcc",
@@ -1331,17 +1338,17 @@ var draftBodyFields = map[string]string{
 }
 
 func (rt *Router) gmailCreateDraft(w http.ResponseWriter, r *http.Request) {
-	body, ok := rt.parseDraftBody(w, r)
+	body, ok := rt.parseMailBody(w, r)
 	if !ok {
 		return
 	}
 	rt.gmailExecute(w, r, "create_draft", body)
 }
 
-// parseDraftBody decodes and validates a drafts request body against
-// draftBodyFields, returning the normalized op params. On any error it writes
-// the HTTP response and returns ok=false.
-func (rt *Router) parseDraftBody(w http.ResponseWriter, r *http.Request) (map[string]any, bool) {
+// parseMailBody decodes and validates an outgoing-message request body (drafts
+// or messages/send) against mailBodyFields, returning the normalized op params.
+// On any error it writes the HTTP response and returns ok=false.
+func (rt *Router) parseMailBody(w http.ResponseWriter, r *http.Request) (map[string]any, bool) {
 	var raw map[string]any
 	if r.Body != nil {
 		defer r.Body.Close()
@@ -1357,7 +1364,7 @@ func (rt *Router) parseDraftBody(w http.ResponseWriter, r *http.Request) (map[st
 				"field \"raw\" is not supported: this endpoint takes structured fields (to, cc, bcc, subject, body) so policies can inspect the content. To reply into a thread, set in_reply_to_message_id.")
 			return nil, false
 		}
-		param, allowed := draftBodyFields[k]
+		param, allowed := mailBodyFields[k]
 		if !allowed {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf(
 				"unknown field %q. Accepted: to, cc, bcc, subject, body, in_reply_to_message_id, thread_id, in_reply_to, references.", k))
@@ -1412,34 +1419,59 @@ func (rt *Router) gmailModifyMessage(w http.ResponseWriter, r *http.Request) {
 	if body == nil {
 		body = map[string]any{}
 	}
-	body["message_id"] = r.PathValue("id")
+	messageID := r.PathValue("id")
 
-	// Gmail's modify endpoint adds/removes labels
-	if addLabels, ok := body["addLabelIds"].([]any); ok && len(addLabels) > 0 {
-		if labelID, ok := addLabels[0].(string); ok {
-			rt.gmailExecute(w, r, "add_label", map[string]any{
-				"message_id": r.PathValue("id"),
-				"label_id":   labelID,
-			})
-			return
-		}
-	}
-	if removeLabels, ok := body["removeLabelIds"].([]any); ok && len(removeLabels) > 0 {
-		if labelID, ok := removeLabels[0].(string); ok {
-			// Check if it's an archive (removing INBOX)
-			if labelID == "INBOX" {
-				rt.gmailExecute(w, r, "archive", map[string]any{
-					"message_id": r.PathValue("id"),
-				})
-				return
-			}
-			rt.gmailExecute(w, r, "remove_label", map[string]any{
-				"message_id": r.PathValue("id"),
-				"label_id":   labelID,
-			})
-			return
-		}
+	// Sieve maps each label change to a DISTINCT policy-gated op (add_label /
+	// remove_label / archive), and each call to gmailExecute runs the full
+	// policy pipeline and writes one HTTP response. So we can dispatch exactly
+	// one label operation per request. Gmail's real modify applies whole
+	// addLabelIds + removeLabelIds arrays at once; rather than silently applying
+	// only the first and dropping the rest (a partial write that returns 200),
+	// we require a single label change per call and fail loud otherwise.
+	adds := stringList(body["addLabelIds"])
+	removes := stringList(body["removeLabelIds"])
+
+	total := len(adds) + len(removes)
+	switch {
+	case total == 0:
+		writeError(w, http.StatusBadRequest, "modify requires addLabelIds or removeLabelIds")
+		return
+	case total > 1:
+		writeError(w, http.StatusBadRequest,
+			"this endpoint applies one label change per call (each is separately policy-gated). Issue a separate modify request for each label in addLabelIds/removeLabelIds.")
+		return
 	}
 
-	writeError(w, http.StatusBadRequest, "modify requires addLabelIds or removeLabelIds")
+	if len(adds) == 1 {
+		rt.gmailExecute(w, r, "add_label", map[string]any{
+			"message_id": messageID,
+			"label_id":   adds[0],
+		})
+		return
+	}
+	// Exactly one remove. Removing INBOX is the archive op.
+	if removes[0] == "INBOX" {
+		rt.gmailExecute(w, r, "archive", map[string]any{"message_id": messageID})
+		return
+	}
+	rt.gmailExecute(w, r, "remove_label", map[string]any{
+		"message_id": messageID,
+		"label_id":   removes[0],
+	})
+}
+
+// stringList coerces a JSON array-of-strings (as decoded into []any) to
+// []string, dropping non-string / empty entries. Returns nil for anything else.
+func stringList(v any) []string {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, x := range arr {
+		if s, ok := x.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }

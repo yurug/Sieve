@@ -122,6 +122,13 @@ curl -X POST "http://localhost:19817/gmail/v1/users/me/messages/send" \
 Note: if the token's policy requires approval for sends, this request
 will block until approved in the Sieve admin UI.
 
+`messages/send` takes the **same structured body as drafts** — `to`, `cc`,
+`bcc`, `subject`, `body`, and the threading fields (`in_reply_to_message_id`,
+etc.). To send a reply that threads correctly, set `in_reply_to_message_id` to
+the parent message's id. As with drafts, unknown fields are rejected with `400`
+(never silently dropped), and an opaque `raw` MIME blob is not accepted — send
+structured fields so policies can inspect the message.
+
 ### Create a draft
 
 ```bash
@@ -199,6 +206,15 @@ curl -X POST "http://localhost:19817/gmail/v1/users/me/messages/MESSAGE_ID/modif
   -H "Content-Type: application/json" \
   -d '{"removeLabelIds": ["INBOX"]}'
 ```
+
+`modify` applies **one label change per call** — each label op (`add_label` /
+`remove_label` / `archive`) is separately policy-gated. A request with more than
+one label across `addLabelIds`/`removeLabelIds` is rejected with `400` rather
+than silently applying only the first; issue a separate `modify` per label.
+
+`GET /messages` additionally accepts repeated `labelIds` (restrict to messages
+carrying all listed labels) and `includeSpamTrash=true`, matching the Gmail
+`messages.list` API.
 
 ## Available endpoints
 

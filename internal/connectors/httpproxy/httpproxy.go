@@ -423,9 +423,11 @@ var operations = []connector.OperationDef{
 		Name:        "proxy_request",
 		Description: "Forward an HTTP request to the target API",
 		Params: map[string]connector.ParamDef{
-			"method": {Type: "string", Description: "HTTP method", Required: true},
-			"path":   {Type: "string", Description: "URL path", Required: true},
-			"body":   {Type: "string", Description: "Request body", Required: false},
+			"method":       {Type: "string", Description: "HTTP method", Required: true},
+			"path":         {Type: "string", Description: "URL path (including any query string)", Required: true},
+			"body":         {Type: "string", Description: "Request body", Required: false},
+			"headers":      {Type: "map", Description: "Additional request headers (map of name→value)", Required: false},
+			"content_type": {Type: "string", Description: "Content-Type for the request body", Required: false},
 		},
 	},
 }

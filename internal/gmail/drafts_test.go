@@ -226,6 +226,33 @@ func TestBuildMIMEMessage_LegacyReplyToStillThreads(t *testing.T) {
 	}
 }
 
+// TestListEmails_PlumbsLabelsAndSpamTrash proves labelIds/includeSpamTrash
+// reach the Gmail messages.list call — previously dropped, so a label-filtered
+// request silently returned the unfiltered superset.
+func TestListEmails_PlumbsLabelsAndSpamTrash(t *testing.T) {
+	var gotLabels []string
+	var gotSpamTrash string
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotLabels = r.URL.Query()["labelIds"]
+		gotSpamTrash = r.URL.Query().Get("includeSpamTrash")
+		json.NewEncoder(w).Encode(&gmailapi.ListMessagesResponse{})
+	})
+
+	_, err := client.ListEmails(context.Background(), SearchQuery{
+		LabelIds:         []string{"INBOX", "UNREAD"},
+		IncludeSpamTrash: true,
+	})
+	if err != nil {
+		t.Fatalf("ListEmails: %v", err)
+	}
+	if len(gotLabels) != 2 || gotLabels[0] != "INBOX" || gotLabels[1] != "UNREAD" {
+		t.Errorf("labelIds on the wire = %v, want [INBOX UNREAD]", gotLabels)
+	}
+	if gotSpamTrash != "true" {
+		t.Errorf("includeSpamTrash = %q, want true", gotSpamTrash)
+	}
+}
+
 func contains(s []string, v string) bool {
 	for _, x := range s {
 		if x == v {

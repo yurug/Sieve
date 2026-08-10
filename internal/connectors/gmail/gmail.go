@@ -419,9 +419,11 @@ var operations = []connector.OperationDef{
 		Name:        "list_emails",
 		Description: "Search and list emails using Gmail query syntax. Returns lightweight stubs (id, thread_id, snippet, labels, and the From/To/Cc/Subject/Date/Message-ID headers) — no body, no attachments. Call read_email to fetch the full content of a specific message. This keeps list responses small enough to fit in agent context windows even with max_results=100.",
 		Params: map[string]connector.ParamDef{
-			"query":       {Type: "string", Description: "Gmail search query string (same syntax as the Gmail web UI search box)", Required: false},
-			"max_results": {Type: "int", Description: "Maximum number of results to return (default 100, max 500)", Required: false},
-			"page_token":  {Type: "string", Description: "Page token for pagination", Required: false},
+			"query":              {Type: "string", Description: "Gmail search query string (same syntax as the Gmail web UI search box)", Required: false},
+			"max_results":        {Type: "int", Description: "Maximum number of results to return (default 100, max 500)", Required: false},
+			"page_token":         {Type: "string", Description: "Page token for pagination", Required: false},
+			"label_ids":          {Type: "[]string", Description: "Restrict results to messages carrying ALL of these label ids", Required: false},
+			"include_spam_trash": {Type: "bool", Description: "Include messages in SPAM and TRASH (default false)", Required: false},
 		},
 		ReadOnly: true,
 	},
@@ -815,9 +817,11 @@ func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[str
 	switch op {
 	case "list_emails":
 		query := gmailclient.SearchQuery{
-			Query:      getStringParam(params, "query"),
-			MaxResults: int64(getIntParam(params, "max_results")),
-			PageToken:  getStringParam(params, "page_token"),
+			Query:            getStringParam(params, "query"),
+			MaxResults:       int64(getIntParam(params, "max_results")),
+			PageToken:        getStringParam(params, "page_token"),
+			LabelIds:         getStringSliceParam(params, "label_ids"),
+			IncludeSpamTrash: getBoolParam(params, "include_spam_trash"),
 		}
 		return g.client.ListEmails(ctx, query)
 
@@ -1323,4 +1327,17 @@ func getStringSliceParam(params map[string]any, key string) []string {
 		return result
 	}
 	return nil
+}
+
+// getBoolParam reads a boolean param, accepting a JSON bool or the string
+// "true"/"1" (query params and form values arrive as strings).
+func getBoolParam(params map[string]any, key string) bool {
+	switch v := params[key].(type) {
+	case bool:
+		return v
+	case string:
+		return v == "true" || v == "1"
+	default:
+		return false
+	}
 }

@@ -6,13 +6,13 @@ import (
 	"testing"
 )
 
-// newDraftBodyReq builds a POST with the given JSON body for parseDraftBody.
+// newDraftBodyReq builds a POST with the given JSON body for parseMailBody.
 func parseBody(t *testing.T, jsonBody string) (map[string]any, int, string) {
 	t.Helper()
 	req := httptest.NewRequest("POST", "/gmail/v1/users/me/drafts", strings.NewReader(jsonBody))
 	rec := httptest.NewRecorder()
 	rt := &Router{}
-	params, ok := rt.parseDraftBody(rec, req)
+	params, ok := rt.parseMailBody(rec, req)
 	if !ok {
 		return nil, rec.Code, rec.Body.String()
 	}
@@ -54,6 +54,39 @@ func TestParseDraftBody_NormalizesCamelCase(t *testing.T) {
 	}
 	if _, present := params["threadId"]; present {
 		t.Errorf("camelCase key should not survive into op params: %v", params)
+	}
+}
+
+// modifyReq drives gmailModifyMessage directly (bare Router), exercising the
+// fail-loud branches that run before any auth/policy stack.
+func modifyReq(t *testing.T, jsonBody string) (int, string) {
+	t.Helper()
+	req := httptest.NewRequest("POST", "/gmail/v1/users/me/messages/m1/modify", strings.NewReader(jsonBody))
+	rec := httptest.NewRecorder()
+	(&Router{}).gmailModifyMessage(rec, req)
+	return rec.Code, rec.Body.String()
+}
+
+func TestModify_RejectsMultipleLabelOps(t *testing.T) {
+	// Two label changes in one call would silently apply only the first under
+	// the old code; now it fails loud rather than doing a partial write.
+	code, body := modifyReq(t, `{"addLabelIds":["A","B"]}`)
+	if code != 400 {
+		t.Fatalf("code = %d, want 400 for a multi-label modify", code)
+	}
+	if !strings.Contains(body, "one label change per call") {
+		t.Errorf("error should explain the one-op limit; got %q", body)
+	}
+	code, _ = modifyReq(t, `{"addLabelIds":["A"],"removeLabelIds":["INBOX"]}`)
+	if code != 400 {
+		t.Errorf("add+remove in one call should 400, got %d", code)
+	}
+}
+
+func TestModify_RejectsEmpty(t *testing.T) {
+	code, body := modifyReq(t, `{}`)
+	if code != 400 || !strings.Contains(body, "addLabelIds or removeLabelIds") {
+		t.Errorf("empty modify: code=%d body=%q", code, body)
 	}
 }
 

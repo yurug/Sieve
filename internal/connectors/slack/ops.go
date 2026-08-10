@@ -2,6 +2,7 @@ package slack
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -72,11 +73,14 @@ var operations = []connector.OperationDef{
 	},
 	{
 		Name:        "post_message",
-		Description: "Post a message to a channel.",
+		Description: "Post a message to a channel. Set thread_ts to reply inside an existing thread; blocks/attachments for rich formatting.",
 		ReadOnly:    false,
 		Params: map[string]connector.ParamDef{
-			"channel": {Type: "string", Required: true},
-			"text":    {Type: "string", Required: true},
+			"channel":     {Type: "string", Required: true},
+			"text":        {Type: "string", Required: true, Description: "Message text (also used as fallback/notification when blocks are set)."},
+			"thread_ts":   {Type: "string", Description: "ts of the parent message to reply into; omit to post a new top-level message."},
+			"blocks":      {Type: "json", Description: "Block Kit blocks (JSON array); Slack chat.postMessage `blocks`."},
+			"attachments": {Type: "json", Description: "Legacy attachments (JSON array); Slack chat.postMessage `attachments`."},
 		},
 	},
 }
@@ -289,9 +293,46 @@ func (c *Connector) opPostMessage(ctx context.Context, params map[string]any) (a
 	v := url.Values{}
 	v.Set("channel", channel)
 	v.Set("text", text)
+	// thread_ts turns this into a reply inside an existing thread. Previously
+	// dropped, so a "reply" silently posted as a new top-level message.
+	if ts, _ := params["thread_ts"].(string); ts != "" {
+		v.Set("thread_ts", ts)
+	}
+	// blocks / attachments are JSON arrays; Slack's form API takes them as a
+	// JSON-encoded string. Accept either a pre-encoded string or a structured
+	// value decoded from the request JSON.
+	if blocks, err := jsonParam(params, "blocks"); err != nil {
+		return nil, err
+	} else if blocks != "" {
+		v.Set("blocks", blocks)
+	}
+	if att, err := jsonParam(params, "attachments"); err != nil {
+		return nil, err
+	} else if att != "" {
+		v.Set("attachments", att)
+	}
 	resp, err := c.client.post(ctx, "chat.postMessage", v)
 	if err != nil {
 		return nil, err
 	}
 	return resp, nil
+}
+
+// jsonParam coerces a param to a JSON-encoded string for Slack form fields that
+// take JSON (blocks, attachments). A string is passed through (assumed already
+// JSON); a structured value (from a decoded JSON request) is marshalled. Returns
+// "" when the param is absent.
+func jsonParam(params map[string]any, key string) (string, error) {
+	switch v := params[key].(type) {
+	case nil:
+		return "", nil
+	case string:
+		return v, nil
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return "", fmt.Errorf("slack: %s must be valid JSON: %w", key, err)
+		}
+		return string(b), nil
+	}
 }

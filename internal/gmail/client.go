@@ -133,6 +133,10 @@ type SearchQuery struct {
 	Query      string // Gmail search query string
 	MaxResults int64
 	PageToken  string
+	// LabelIds restricts results to messages carrying ALL of these label ids
+	// (Gmail's messages.list labelIds). IncludeSpamTrash includes SPAM/TRASH.
+	LabelIds         []string
+	IncludeSpamTrash bool
 }
 
 // SearchResult contains the results of an email search. Emails are returned
@@ -183,6 +187,12 @@ func (c *Client) ListEmails(ctx context.Context, query SearchQuery) (*SearchResu
 	}
 	if query.PageToken != "" {
 		call = call.PageToken(query.PageToken)
+	}
+	if len(query.LabelIds) > 0 {
+		call = call.LabelIds(query.LabelIds...)
+	}
+	if query.IncludeSpamTrash {
+		call = call.IncludeSpamTrash(true)
 	}
 
 	resp, err := call.Do()
