@@ -2,7 +2,7 @@ data/
 /sieve
 /testserver
 *.db
-*client_secret*.json
+*client_secret*
 *credentials*.json
 .env
 .gh_token
