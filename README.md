@@ -446,29 +446,6 @@ The trade-off: **reboot requires re-entering the passphrase.** Sieve refuses to 
 
 Full threat model, rotation procedure, and deployment recipes: [docs/credential-encryption.md](docs/credential-encryption.md).
 
-## Configuration
-
-```yaml
-# sieve.yaml
-server:
-  host: "127.0.0.1"   # bind address (0.0.0.0 for all interfaces)
-  api_port: 19817      # agent-facing API/MCP port
-  ui_port: 19816       # human-facing web UI port
-  # Optional: path to a file containing the keyring passphrase. If unset,
-  # Sieve prompts on TTY or reads from SIEVE_PASSPHRASE_FILE / FD 3.
-  # passphrase_file: "/run/secrets/sieve-passphrase"
-
-connectors:
-  google:
-    client_credentials_file: "./data/gmail_credentials.json"
-
-policy:
-  scripts_dir: "./policies"
-
-database:
-  path: "./data/sieve.db"
-```
-
 ## License
 
 MIT

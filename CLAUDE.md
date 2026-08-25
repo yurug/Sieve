@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What Sieve is
 
-A credential gateway between AI agents and real services (Gmail, AWS, LLM APIs, arbitrary HTTP). Sieve holds the real credentials, issues scoped sub-tokens to agents, and runs every request through a two-stage policy pipeline (pre-execution decision + post-execution response filters). See `README.md` and `SPEC.md` for the full product rationale.
+A credential gateway between AI agents and real services (Gmail, AWS, LLM APIs, arbitrary HTTP). Sieve holds the real credentials, issues scoped sub-tokens to agents, and runs every request through a two-stage policy pipeline (pre-execution decision + post-execution response filters). See `README.md` for the full product rationale (`docs/archive/SPEC-v1.md` is the original v1 design doc, kept for historical context; its ports and CLI are outdated).
 
 ## Build, run, test
 

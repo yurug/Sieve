@@ -1,3 +1,8 @@
+> **Archived: original v1 design document.** Kept for historical context only.
+> Ports (8080/8081), the `sieve connection add` CLI, and the policy model
+> described below are outdated and do not match the current codebase. For
+> current behavior, see the top-level `README.md` and the docs in `docs/`.
+
 # Sieve
 
 **A capability-scoped API gateway for AI agents.**

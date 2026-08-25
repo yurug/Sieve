@@ -12,7 +12,6 @@ services:
     volumes:
       - ./data:/data
       - ./policies:/policies:ro
-      - ./sieve.yaml:/etc/sieve/sieve.yaml:ro   # currently unused; reserved for future --config support
     security_opt:
       - no-new-privileges:true
     cap_drop:
