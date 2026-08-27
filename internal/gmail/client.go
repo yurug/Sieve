@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"mime"
 	"net/mail"
 	"strings"
 	"time"
@@ -756,6 +757,40 @@ func parseAddressList(s string) []string {
 	return result
 }
 
+// encodeAddressList renders recipients for an address header, RFC 2047-encoding
+// any non-ASCII display name while leaving the address literal. A pure-ASCII
+// entry (a bare address or "Name <addr>") is passed through unchanged, so the
+// common case is byte-identical to before. A non-ASCII entry is parsed and
+// re-emitted via mail.Address.String() (which encodes only the display name);
+// if it can't be parsed, the whole entry is word-encoded as a 7-bit-safe
+// fallback rather than emitting raw UTF-8 bytes into the header.
+func encodeAddressList(addrs []string) string {
+	out := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		switch {
+		case isASCII(a):
+			out = append(out, a)
+		default:
+			if parsed, err := mail.ParseAddress(a); err == nil {
+				out = append(out, parsed.String())
+			} else {
+				out = append(out, mime.QEncoding.Encode("utf-8", a))
+			}
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
+// isASCII reports whether s contains only 7-bit bytes.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
 // buildMIMEMessage creates an RFC 2822 message from a DraftRequest.
 func buildMIMEMessage(req DraftRequest) ([]byte, error) {
 	var buf strings.Builder
@@ -764,15 +799,19 @@ func buildMIMEMessage(req DraftRequest) ([]byte, error) {
 	buf.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
 
 	if len(req.To) > 0 {
-		buf.WriteString(fmt.Sprintf("To: %s\r\n", strings.Join(req.To, ", ")))
+		buf.WriteString(fmt.Sprintf("To: %s\r\n", encodeAddressList(req.To)))
 	}
 	if len(req.Cc) > 0 {
-		buf.WriteString(fmt.Sprintf("Cc: %s\r\n", strings.Join(req.Cc, ", ")))
+		buf.WriteString(fmt.Sprintf("Cc: %s\r\n", encodeAddressList(req.Cc)))
 	}
 	if len(req.Bcc) > 0 {
-		buf.WriteString(fmt.Sprintf("Bcc: %s\r\n", strings.Join(req.Bcc, ", ")))
+		buf.WriteString(fmt.Sprintf("Bcc: %s\r\n", encodeAddressList(req.Bcc)))
 	}
-	buf.WriteString(fmt.Sprintf("Subject: %s\r\n", req.Subject))
+	// RFC 2047-encode the Subject. A header is ASCII-only (RFC 5322); writing raw
+	// UTF-8 bytes makes downstream clients reinterpret them as latin1/cp1252 (the
+	// "â€“" mojibake). QEncoding returns pure-ASCII input unchanged, so ASCII
+	// subjects are byte-identical to before.
+	buf.WriteString(fmt.Sprintf("Subject: %s\r\n", mime.QEncoding.Encode("utf-8", req.Subject)))
 
 	// Threading headers. Prefer the explicit InReplyTo/References; fall back to
 	// the legacy ReplyTo (a Gmail message id used as a stand-in Message-ID).

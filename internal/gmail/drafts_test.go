@@ -1,10 +1,14 @@
 package gmail
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"mime"
 	"net/http"
+	"net/mail"
 	"strings"
 	"testing"
 
@@ -250,6 +254,83 @@ func TestListEmails_PlumbsLabelsAndSpamTrash(t *testing.T) {
 	}
 	if gotSpamTrash != "true" {
 		t.Errorf("includeSpamTrash = %q, want true", gotSpamTrash)
+	}
+}
+
+// TestBuildMIMEMessage_EncodesNonASCIISubject is the regression test for the
+// mojibake bug: a subject with a non-ASCII character (U+2013 en dash) must be
+// RFC 2047-encoded on the wire — never emitted as raw UTF-8 bytes, which
+// downstream clients reinterpret as cp1252. The body, being charset-tagged,
+// keeps its literal UTF-8.
+func TestBuildMIMEMessage_EncodesNonASCIISubject(t *testing.T) {
+	const subj = "Re: 2025 DRAFT RETURN – Breitman, Arthur" // U+2013
+	const body = "…settled — please carry…"                 // U+2014 in body
+
+	raw, err := buildMIMEMessage(DraftRequest{To: []string{"x@example.com"}, Subject: subj, Body: body})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("parse message: %v", err)
+	}
+
+	rawSubject := msg.Header.Get("Subject")
+	if !isASCII(rawSubject) {
+		t.Fatalf("Subject header carries raw non-ASCII bytes (mojibake bug): %q", rawSubject)
+	}
+	decoded, err := new(mime.WordDecoder).DecodeHeader(rawSubject)
+	if err != nil {
+		t.Fatalf("decode subject: %v", err)
+	}
+	if decoded != subj {
+		t.Errorf("decoded subject = %q, want %q", decoded, subj)
+	}
+
+	// Body is charset-tagged UTF-8, so its bytes stay literal.
+	bodyBytes, _ := io.ReadAll(msg.Body)
+	if !strings.Contains(string(bodyBytes), "—") {
+		t.Errorf("body must keep literal UTF-8 em dash; got %q", bodyBytes)
+	}
+}
+
+// TestBuildMIMEMessage_ASCIISubjectUnchanged guards against churn: a plain ASCII
+// subject must be written verbatim (no needless encoded-word).
+func TestBuildMIMEMessage_ASCIISubjectUnchanged(t *testing.T) {
+	raw, err := buildMIMEMessage(DraftRequest{Subject: "Plain ASCII: hello world", Body: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Subject: Plain ASCII: hello world\r\n") {
+		t.Errorf("ASCII subject must be verbatim; got:\n%s", raw)
+	}
+}
+
+// TestBuildMIMEMessage_EncodesNonASCIIDisplayName proves the address headers get
+// the same treatment: a non-ASCII display name is encoded, the address stays
+// literal, and the header round-trips.
+func TestBuildMIMEMessage_EncodesNonASCIIDisplayName(t *testing.T) {
+	raw, err := buildMIMEMessage(DraftRequest{
+		To:      []string{"Björk Guðmundsdóttir <bjork@example.com>", "plain@example.com"},
+		Subject: "s", Body: "b",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("parse message: %v", err)
+	}
+	rawTo := msg.Header.Get("To")
+	if !isASCII(rawTo) {
+		t.Fatalf("To header carries raw non-ASCII bytes: %q", rawTo)
+	}
+	addrs, err := mail.ParseAddressList(rawTo)
+	if err != nil {
+		t.Fatalf("parse To: %v", err)
+	}
+	if len(addrs) != 2 || addrs[0].Name != "Björk Guðmundsdóttir" || addrs[0].Address != "bjork@example.com" {
+		t.Errorf("To round-trip wrong: %+v", addrs)
 	}
 }
 
