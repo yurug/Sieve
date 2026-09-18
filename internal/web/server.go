@@ -1496,7 +1496,21 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	http.Redirect(w, r, "/connections", http.StatusSeeOther)
+	http.Redirect(w, r, googleOAuthSuccessRedirect(pending.ID, profile.EmailAddress), http.StatusSeeOther)
+}
+
+// googleOAuthSuccessRedirect builds the /connections redirect target after a
+// successful Google OAuth callback (VPA-X01 fork, item A.7). Query params let
+// a caller that relayed this callback (an iframe, a proxied redirect, ...)
+// learn which connection and which Google mailbox just got bound — the
+// redirect itself carries no body, and no template renders
+// profile.EmailAddress. connections.html ignores unknown query params, so
+// this is additive: anything that already handles a bare "/connections"
+// redirect keeps working unchanged. Both values are url.QueryEscape'd
+// because an email address routinely contains "+" (Gmail's plus-addressing)
+// and "@", both of which are query-string-significant characters.
+func googleOAuthSuccessRedirect(connID, email string) string {
+	return "/connections?connected=" + url.QueryEscape(connID) + "&account=" + url.QueryEscape(email)
 }
 
 // matchesReauthIdentity returns nil if the OAuth consent that just completed
