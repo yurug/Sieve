@@ -47,8 +47,25 @@ const tokenContextKey contextKey = "token"
 // APPROVED approval item on the REST ops path (VPA-X01 fork). Its presence
 // switches executeOperation to an entirely separate branch (see
 // executeApprovalReplay) that never re-runs IAM.Decide and never reads
-// params from this request — see that function's doc comment for why.
+// params from this request — see that function's doc comment for why. See
+// also approvalModeHeader below: a caller that opts into async mode gets
+// this id back immediately instead of waiting up to 5 minutes to learn it.
 const approvalReplayHeader = "X-Sieve-Approval-Id"
+
+// approvalModeHeader (VPA-X01 fork, item A.6) opts a single ops-path
+// request into non-blocking approval handling: on approval_required, the
+// item is Submitted and the response comes back immediately as 429 +
+// Retry-After with the approval id, instead of the default behavior of
+// blocking in WaitForResolution for up to 5 minutes and — on timeout —
+// surfacing no id at all (the gap approvalReplayHeader exists to work
+// around). Only approvalModeAsync is a recognized value; anything else
+// (including a typo'd casing) is a 400, not a silent fallback to blocking,
+// so a caller doesn't quietly get the wrong mode. Header absent → the
+// original behavior, byte for byte.
+const (
+	approvalModeHeader = "X-Sieve-Approval-Mode"
+	approvalModeAsync  = "async"
+)
 
 // Router holds the dependencies for the REST API handlers. IAM (internal/iam) is
 // the sole authorization engine: every operation's decision source is iam.Decide.
@@ -294,6 +311,19 @@ func (rt *Router) executeOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Async approval mode (VPA-X01 fork, item A.6): validated up front,
+	// independent of what the policy decision turns out to be, so an
+	// invalid value always 400s the same way rather than being silently
+	// ignored on a request that happens to resolve to "allow". Empty
+	// (header absent) is the only other valid state and means "blocking,
+	// as before" — checked again where it matters, in the
+	// approval_required case below.
+	approvalMode := r.Header.Get(approvalModeHeader)
+	if approvalMode != "" && approvalMode != approvalModeAsync {
+		writeError(w, http.StatusBadRequest, "invalid X-Sieve-Approval-Mode")
+		return
+	}
+
 	// Parse params from body (POST) or query string (GET). The policy decision
 	// matches conditions on these, and it must run before anything
 	// connection-specific is revealed, so parse first.
@@ -442,6 +472,14 @@ func (rt *Router) executeOperation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Async mode (VPA-X01 fork, item A.6): answer now, don't wait. The
+		// item is already Submitted above exactly as the blocking path
+		// does — only what happens AFTER Submit differs.
+		if approvalMode == approvalModeAsync {
+			rt.writeAsyncApprovalRequired(w, tok, connID, operation, params, item, start)
+			return
+		}
+
 		resolved, err := rt.approval.WaitForResolution(item.ID, 5*time.Minute)
 		if err != nil {
 			rt.logAudit(tok, connID, operation, params, "approval_timeout", "", time.Since(start).Milliseconds())
@@ -535,6 +573,39 @@ func (rt *Router) executeOperation(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("unknown policy action: %s", decision.Action))
 	}
+}
+
+// writeAsyncApprovalRequired answers an approval_required decision
+// immediately with 429 + Retry-After, carrying the approval id, instead of
+// executeOperation's default of blocking in WaitForResolution for up to 5
+// minutes (VPA-X01 fork, item A.6). Mirrors the response shape already
+// used by gmailExecute/handleProxy for the same "approval_required, don't
+// block" situation, so an agent wrapper that already knows how to poll one
+// of those surfaces needs no new logic for this one. Audited as
+// "approval_required", matching those other two paths — NOT
+// "approval_timeout", since nothing timed out here; the caller chose not
+// to wait.
+func (rt *Router) writeAsyncApprovalRequired(w http.ResponseWriter, tok *tokens.Token, connID, operation string, params map[string]any, item *approval.Item, start time.Time) {
+	rt.logAudit(tok, connID, operation, params, "approval_required", "", time.Since(start).Milliseconds())
+
+	// item.ExpiresAt is nil whenever --approval-ttl is unset (0, the
+	// default) — encode that as JSON null rather than an empty string, so
+	// a caller doesn't have to special-case "" as well as absence.
+	var expiresAt any
+	if item.ExpiresAt != nil {
+		expiresAt = item.ExpiresAt.Format(time.RFC3339)
+	}
+
+	w.Header().Set("Retry-After", "30")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	json.NewEncoder(w).Encode(map[string]any{
+		"error":        "approval_required",
+		"message":      "action requires human approval",
+		"approval_id":  item.ID,
+		"approval_url": "/api/v1/approvals/" + item.ID + "/status",
+		"expires_at":   expiresAt,
+	})
 }
 
 // executeApprovalReplay redeems a previously-APPROVED approval item and
