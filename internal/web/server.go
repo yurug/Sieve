@@ -945,6 +945,7 @@ func (s *Server) handleConnectionAdd(w http.ResponseWriter, r *http.Request) {
 			s.writeConnectionError(w, http.StatusInternalServerError, err.Error(), err)
 			return
 		}
+		warnIfAuthValueScrubStreaming(id, connectorType, config)
 		_ = s.audit.LogOperator(operatorDisplayName(r, s), "connection.add", id,
 			map[string]any{"connector_type": connectorType, "display_name": displayName},
 			"success")

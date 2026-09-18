@@ -212,6 +212,25 @@ curl http://localhost:19817/proxy/twilio/2010-04-01/Accounts.json \
   -H "Authorization: Bearer sieve_tok_xxxxx"
 ```
 
+### Streaming responses and `auth_value_scrub`
+
+Every HTTP Proxy connection has an `auth_value_scrub` setting (on by
+default, editable from the connection's edit page). When enabled, Sieve
+buffers the **entire** upstream response body so it can redact the real
+credential before it reaches the agent (in case the target API ever echoes
+the key back, e.g. in an error message).
+
+This buffering means a streaming upstream response (SSE, chunked
+transfer, or any other incrementally-delivered body) is delivered to the
+agent as a single burst only after the full response has arrived, not
+incrementally. If you're proxying a streaming API (e.g. an LLM provider's
+`stream: true` endpoint) and the agent appears to hang until the whole
+response completes, this is why. Sieve logs a one-line warning to the
+server log whenever a connection is saved with `auth_value_scrub` enabled,
+naming the connection. Turn it off on the connection's edit page if you
+need low-latency streaming and accept the (small) risk of an echoed
+credential reaching the agent unredacted.
+
 ### Connection table entry
 
 | Alias  | Service    | Display Name | Added    |

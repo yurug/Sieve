@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"regexp"
 	"sort"
@@ -114,6 +115,48 @@ var staticHTTPProxyBaselineKeys = []string{
 	"Transfer-Encoding",
 	"Upgrade",
 	"X-Forwarded-*",
+}
+
+// shouldWarnAuthValueScrubStreaming reports whether saving this connector
+// config should emit the auth_value_scrub streaming-buffering warning
+// (VPA-X01 drill finding #12). Only http_proxy connections are affected —
+// auth_value_scrub is that connector's field. Split out from the log.Printf
+// call site (warnIfAuthValueScrubStreaming) so the decision is unit-
+// testable without capturing global log output.
+func shouldWarnAuthValueScrubStreaming(connectorType string, cfg map[string]any) bool {
+	if connectorType != "http_proxy" {
+		return false
+	}
+	scrub, ok := cfg["auth_value_scrub"].(bool)
+	if !ok {
+		// auth_value_scrub is EditOnly (httpproxy.go) — a CREATE-mode cfg
+		// never has the key at all, since applyConnectorFormFields only
+		// populates fields valid for the current form mode. The connector
+		// factory's own default in that case is true (scrub ON), so warn.
+		return true
+	}
+	return scrub
+}
+
+// warnIfAuthValueScrubStreaming logs a one-line WARNING when an http_proxy
+// connection is saved (create or edit) with auth_value_scrub enabled
+// (VPA-X01 drill finding #12). AuthValueScrubFilter buffers the ENTIRE
+// response body to redact the configured credential, which silently turns
+// a streaming (SSE/chunked) upstream response into one blocking burst
+// delivered only after the full body arrives — an operator debugging a
+// connection that appears to "hang" on every request had no signal
+// pointing at this setting. No behavior change: this only makes the
+// existing trade-off visible in the server log; opting out
+// (auth_value_scrub=false) remains the operator's existing lever.
+func warnIfAuthValueScrubStreaming(connID, connectorType string, cfg map[string]any) {
+	if !shouldWarnAuthValueScrubStreaming(connectorType, cfg) {
+		return
+	}
+	log.Printf("connection %q (http_proxy): auth_value_scrub is enabled — streaming "+
+		"responses through this connection will be buffered in full before being "+
+		"returned to the agent; see docs/connections-guide.md (Generic HTTP Proxy) "+
+		"or disable auth_value_scrub on the connection's edit page if you need "+
+		"low-latency streaming", connID)
 }
 
 // handleConnectionEditPage renders the connection-edit page. GET only.
@@ -231,6 +274,8 @@ func (s *Server) handleConnectionEditSave(w http.ResponseWriter, r *http.Request
 		s.renderEditErrorWithConfig(w, r, conn, cfg, "save failed: "+err.Error())
 		return
 	}
+
+	warnIfAuthValueScrubStreaming(id, conn.ConnectorType, cfg)
 
 	// Audit the field names whose values reached the saved config — never
 	// the values themselves, since Secret fields are present in cfg. The
