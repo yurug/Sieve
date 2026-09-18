@@ -43,6 +43,13 @@ type contextKey string
 
 const tokenContextKey contextKey = "token"
 
+// approvalReplayHeader is the request header that redeems a previously
+// APPROVED approval item on the REST ops path (VPA-X01 fork). Its presence
+// switches executeOperation to an entirely separate branch (see
+// executeApprovalReplay) that never re-runs IAM.Decide and never reads
+// params from this request — see that function's doc comment for why.
+const approvalReplayHeader = "X-Sieve-Approval-Id"
+
 // Router holds the dependencies for the REST API handlers. IAM (internal/iam) is
 // the sole authorization engine: every operation's decision source is iam.Decide.
 type Router struct {
@@ -273,6 +280,19 @@ func (rt *Router) executeOperation(w http.ResponseWriter, r *http.Request) {
 
 	connID := r.PathValue("conn")
 	operation := r.PathValue("operation")
+
+	// Replay-by-approval-id (VPA-X01 fork): a caller presenting this header
+	// already has an APPROVED item's id (learned via the --approval-webhook
+	// notification, the admin JSON API, or a prior /approvals/{id}/status
+	// poll) and wants to execute it now — most usefully after the ORIGINAL
+	// request's WaitForResolution below already timed out (5 minutes) with
+	// nothing executed, leaving the item approved-but-unredeemed. This is a
+	// disjoint branch, not a case inside the switch below: it never touches
+	// this request's body/query params (see executeApprovalReplay).
+	if approvalID := r.Header.Get(approvalReplayHeader); approvalID != "" {
+		rt.executeApprovalReplay(w, r, tok, connID, operation, start, approvalID)
+		return
+	}
 
 	// Parse params from body (POST) or query string (GET). The policy decision
 	// matches conditions on these, and it must run before anything
@@ -515,6 +535,125 @@ func (rt *Router) executeOperation(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("unknown policy action: %s", decision.Action))
 	}
+}
+
+// executeApprovalReplay redeems a previously-APPROVED approval item and
+// executes its operation using the item's stored request_data — this
+// request's own body/query params are never consulted (VPA-X01 fork).
+//
+// This is a disjoint branch from executeOperation's normal decide/execute
+// flow, not a case added to it: replay does NOT re-run IAM.Decide. The
+// earlier Submit already recorded that this exact (token, connection,
+// operation) triple was decided approval_required, and a human then
+// approved THAT request; re-deciding on replay would let a policy change
+// made in between silently reinterpret an already-approved action, which
+// isn't this feature's job — an operator who wants to invalidate stale
+// approvals after a policy change uses ExpireStale (via --approval-ttl) or
+// rejects them directly, not a race with this handler.
+//
+// Known scope limit: the original decision's response Filters are not
+// re-applied here, because approval.Item persists request_data only, not
+// the PolicyDecision that authorized it. A replayed operation's response is
+// therefore NOT scrubbed by e.g. auth_value_scrub. Closing this would mean
+// persisting (or re-deriving) the original decision per item — a larger
+// change than "add replay," left for a follow-up.
+func (rt *Router) executeApprovalReplay(w http.ResponseWriter, r *http.Request, tok *tokens.Token, connID, operation string, start time.Time, approvalID string) {
+	item, err := rt.approval.Get(approvalID)
+	if err != nil {
+		// Unknown id is indistinguishable from "belongs to someone else" —
+		// both are "approval mismatch", never a 404, so a probe can't tell
+		// the two apart (same not-authorized-oracle principle as
+		// writeNotAuthorized elsewhere in this file).
+		rt.logAudit(tok, connID, operation, nil, "approved_replay(mismatch)", "unknown approval id", time.Since(start).Milliseconds())
+		writeError(w, http.StatusForbidden, "approval mismatch")
+		return
+	}
+	if item.TokenID != tok.ID || item.ConnectionID != connID || item.Operation != operation {
+		rt.logAudit(tok, connID, operation, nil, "approved_replay(mismatch)", "", time.Since(start).Milliseconds())
+		writeError(w, http.StatusForbidden, "approval mismatch")
+		return
+	}
+
+	switch item.Status {
+	case approval.StatusPending:
+		rt.logAudit(tok, connID, operation, item.RequestData, "approved_replay(pending)", "", time.Since(start).Milliseconds())
+		writeError(w, http.StatusConflict, "approval pending")
+		return
+	case approval.StatusRejected:
+		// Covers both an operator's explicit Reject AND ExpireStale's TTL
+		// expiry — ExpireStale stores expired items as StatusRejected
+		// (resolved_by="expired"), so both surface identically here.
+		rt.logAudit(tok, connID, operation, item.RequestData, "approved_replay(rejected)", "", time.Since(start).Milliseconds())
+		writeError(w, http.StatusForbidden, "approval rejected")
+		return
+	}
+	// Only StatusApproved reaches here — Status is a closed 3-value enum
+	// and both other values returned above.
+
+	// Atomically claim the execution slot BEFORE calling the connector, so
+	// two racing replay requests can't both pass this point: only the
+	// caller whose UPDATE actually flips executed_at from NULL executes.
+	marked, err := rt.approval.MarkExecuted(item.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("mark approval executed: %v", err))
+		return
+	}
+	if !marked {
+		rt.logAudit(tok, connID, operation, item.RequestData, "approved_replay(already_executed)", "", time.Since(start).Milliseconds())
+		writeError(w, http.StatusConflict, "already executed")
+		return
+	}
+
+	conn, err := rt.connections.GetConnector(connID)
+	if err != nil {
+		rt.writeConnectionError(w, http.StatusNotFound, fmt.Sprintf("connector not found: %v", err), connID, err)
+		return
+	}
+
+	result, err := conn.Execute(r.Context(), operation, item.RequestData)
+	if err != nil {
+		// Same error-class mapping as the pre-approval and post-approval
+		// paths above, so a replayed failure is indistinguishable in kind
+		// from an inline one.
+		if errors.Is(err, httpproxy.ErrHeaderDenied) {
+			rt.logAudit(tok, connID, operation, item.RequestData, "http_proxy.header_denied", err.Error(), time.Since(start).Milliseconds())
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, mcpproxy.ErrResponseOversized) {
+			rt.logAudit(tok, connID, operation, item.RequestData, "mcp_proxy.response_oversized", err.Error(), time.Since(start).Milliseconds())
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if errors.Is(err, githubconn.ErrCrossForkHeadDenied) {
+			rt.logAudit(tok, connID, operation, item.RequestData, "github.cross_fork_head_denied", err.Error(), time.Since(start).Milliseconds())
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		if errors.Is(err, connector.ErrOperationNotEnabled) {
+			reason := stripSentinelPrefix(err, connector.ErrOperationNotEnabled)
+			rt.logAudit(tok, connID, operation, item.RequestData, "operation_not_enabled", reason, time.Since(start).Milliseconds())
+			writeOperationNotEnabledError(w, connID, operation, reason)
+			return
+		}
+		rt.logAudit(tok, connID, operation, item.RequestData, "approved_replay(error)", "", time.Since(start).Milliseconds())
+		if errors.Is(err, connector.ErrNeedsReauth) {
+			reason := err.Error()
+			if c, e := rt.connections.Get(connID); e == nil && c.ReauthReason != "" {
+				reason = c.ReauthReason
+			}
+			writeReauthError(w, connID, reason)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("execute operation: %v", err))
+		return
+	}
+
+	resultJSON, _ := json.Marshal(result)
+	rt.logAudit(tok, connID, operation, item.RequestData, "approved_replay", "", time.Since(start).Milliseconds())
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(resultJSON)
 }
 
 // decide produces the policy decision for a request. When the IAM engine is
