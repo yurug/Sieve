@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -494,6 +495,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /approvals", s.handleApprovals)
 	mux.HandleFunc("POST /approvals/{id}/approve", s.handleApprovalApprove)
 	mux.HandleFunc("POST /approvals/{id}/reject", s.handleApprovalReject)
+
+	// Admin JSON approvals API (VPA-X01 fork): the HTML handlers above
+	// redirect back to /approvals for a browser form post; an external
+	// approval dashboard/bot needs a machine-readable equivalent instead.
+	// Same operator-session + CSRF gate as every other admin POST, via
+	// adminAuthWrapper — these paths are not in authExemptPaths.
+	mux.HandleFunc("GET /api/approvals", s.handleAPIApprovalsList)
+	mux.HandleFunc("POST /api/approvals/{id}/approve", s.handleAPIApprovalApprove)
+	mux.HandleFunc("POST /api/approvals/{id}/reject", s.handleAPIApprovalReject)
 
 	// Audit
 	mux.HandleFunc("GET /audit", s.handleAudit)
@@ -1864,6 +1874,173 @@ func (s *Server) handleApprovalReject(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.audit.LogOperator(operatorDisplayName(r, s), "approval.reject", id, nil, "success")
 	http.Redirect(w, r, "/approvals", http.StatusSeeOther)
+}
+
+// --- Admin JSON approvals API (VPA-X01 fork) ---
+//
+// A machine-readable equivalent of the HTML handlers above, for an external
+// approval dashboard/bot that wants to list/approve/reject without scraping
+// rendered HTML. Gated identically to every other admin endpoint —
+// requireOperatorSession (adminAuthWrapper) enforces the session cookie +
+// CSRF token, since these paths are not in authExemptPaths.
+
+// writeApprovalsJSON is the shared JSON-response writer for this API —
+// every handler below returns exactly one JSON object, so a single helper
+// keeps the Content-Type/status/encode triplet from drifting between them.
+func writeApprovalsJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+// handleAPIApprovalsList returns approval items as JSON. status=pending
+// (the default) mirrors the HTML page's default view; status=all includes
+// resolved items, newest first. limit bounds the count (default 50);
+// ListPending has no native limit parameter, so the pending branch trims
+// the result after fetching rather than teaching the queue a second
+// pagination path for a case with no natural "offset" (pending items don't
+// need one — there's rarely more than a handful outstanding at once).
+func (s *Server) handleAPIApprovalsList(w http.ResponseWriter, r *http.Request) {
+	status := r.URL.Query().Get("status")
+	if status == "" {
+		status = "pending"
+	}
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
+			limit = n
+		}
+	}
+
+	var items []approval.Item
+	var err error
+	switch status {
+	case "pending":
+		items, err = s.approval.ListPending()
+		if err == nil && len(items) > limit {
+			items = items[:limit]
+		}
+	case "all":
+		items, err = s.approval.ListAll(limit, 0)
+	default:
+		writeApprovalsJSON(w, http.StatusBadRequest, map[string]string{"error": "status must be 'pending' or 'all'"})
+		return
+	}
+	if err != nil {
+		writeApprovalsJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if items == nil {
+		items = []approval.Item{}
+	}
+	writeApprovalsJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// approvalActionRequestBody is the optional JSON body accepted by
+// handleAPIApprovalApprove. A nil RequestData means "approve as submitted";
+// a non-nil one triggers edit-then-approve.
+type approvalActionRequestBody struct {
+	RequestData map[string]any `json:"request_data"`
+}
+
+// decodeApprovalActionBody reads an optional JSON body without treating a
+// genuinely empty body (the common case — plain approve/reject) as an
+// error. Returns a zero-value body and no error when the request carries
+// no content.
+func decodeApprovalActionBody(r *http.Request) (approvalActionRequestBody, error) {
+	var body approvalActionRequestBody
+	if r.Body == nil || r.ContentLength == 0 {
+		return body, nil
+	}
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&body); err != nil {
+		if err == io.EOF {
+			return body, nil // empty body, e.g. Content-Length unset over chunked encoding
+		}
+		return body, err
+	}
+	return body, nil
+}
+
+// handleAPIApprovalApprove approves a pending item, optionally editing its
+// request_data first (edit-then-approve): an operator who spots a
+// malformed or overly-broad request can correct it here instead of
+// rejecting outright and making the agent resubmit from scratch. The edit
+// is audited as its own action (approval.edit) BEFORE the approve action,
+// so the audit trail shows what was approved, not just that something was.
+func (s *Server) handleAPIApprovalApprove(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	item, err := s.approval.Get(id)
+	if err != nil {
+		writeApprovalsJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	if item.Status != approval.StatusPending {
+		writeApprovalsJSON(w, http.StatusConflict, map[string]string{"error": "already resolved"})
+		return
+	}
+
+	body, err := decodeApprovalActionBody(r)
+	if err != nil {
+		writeApprovalsJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+
+	if body.RequestData != nil {
+		if err := s.approval.SetRequestData(id, body.RequestData); err != nil {
+			// Only reachable if the item was resolved by someone else
+			// between the Get above and this write (double-resolution
+			// race) — SetRequestData's own status='pending' guard.
+			writeApprovalsJSON(w, http.StatusConflict, map[string]string{"error": "already resolved"})
+			return
+		}
+		_ = s.audit.LogOperator(operatorDisplayName(r, s), "approval.edit", id,
+			map[string]any{"request_data": body.RequestData}, "success")
+	}
+
+	if err := s.approval.Approve(id); err != nil {
+		writeApprovalsJSON(w, http.StatusConflict, map[string]string{"error": "already resolved"})
+		return
+	}
+	_ = s.audit.LogOperator(operatorDisplayName(r, s), "approval.approve", id, nil, "success")
+
+	updated, err := s.approval.Get(id)
+	if err != nil {
+		writeApprovalsJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeApprovalsJSON(w, http.StatusOK, map[string]any{"ok": true, "item": updated})
+}
+
+// handleAPIApprovalReject rejects a pending item and returns it as JSON.
+// Unlike approve, reject never edits request_data — there's nothing to
+// correct on a request that's being refused outright.
+func (s *Server) handleAPIApprovalReject(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	item, err := s.approval.Get(id)
+	if err != nil {
+		writeApprovalsJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	if item.Status != approval.StatusPending {
+		writeApprovalsJSON(w, http.StatusConflict, map[string]string{"error": "already resolved"})
+		return
+	}
+
+	if err := s.approval.Reject(id); err != nil {
+		writeApprovalsJSON(w, http.StatusConflict, map[string]string{"error": "already resolved"})
+		return
+	}
+	_ = s.audit.LogOperator(operatorDisplayName(r, s), "approval.reject", id, nil, "success")
+
+	updated, err := s.approval.Get(id)
+	if err != nil {
+		writeApprovalsJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeApprovalsJSON(w, http.StatusOK, map[string]any{"ok": true, "item": updated})
 }
 
 // --- Audit handlers ---
