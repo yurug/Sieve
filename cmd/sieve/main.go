@@ -150,6 +150,19 @@ func main() {
 				"Credentials pasted in the admin UI take precedence.")
 		asanaClientSecret = flag.String("asana-client-secret", os.Getenv("ASANA_CLIENT_SECRET"),
 			"Asana app client_secret. Falls back to $ASANA_CLIENT_SECRET.")
+
+		// Approval queue (VPA-X01 fork): bound how long a request may sit
+		// pending, and optionally notify an external system when one is
+		// submitted. Both default to "off" — zero behavior change for an
+		// operator who doesn't set them.
+		approvalTTL = flag.Duration("approval-ttl", 0,
+			"expire a pending approval request after this long (e.g. 30m), auto-rejecting it "+
+				"(resolved_by=\"expired\"). 0 (default) disables expiry — requests stay pending "+
+				"until a human acts, no matter how long that takes.")
+		approvalWebhookURL = flag.String("approval-webhook", "",
+			"POST a JSON notification ({id, token_id, connection_id, operation, created_at, "+
+				"expires_at} — never request_data) to this URL, best-effort, whenever a new "+
+				"approval is submitted. Empty (default) disables the webhook.")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags]\n", os.Args[0])
@@ -187,7 +200,7 @@ func main() {
 		AsanaClientID:      *asanaClientID,
 		AsanaClientSecret:  *asanaClientSecret,
 	}
-	if err := run(*dbPath, *webAddr, *apiAddr, *setup, *googleCredsPath, oauthClients); err != nil {
+	if err := run(*dbPath, *webAddr, *apiAddr, *setup, *googleCredsPath, oauthClients, *approvalTTL, *approvalWebhookURL); err != nil {
 		log.SetFlags(0)
 		log.Fatalf("sieve: %v", err)
 	}
@@ -475,7 +488,7 @@ func operatorPrefersPlaintextAdmin(s *settings.Service) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "http://")
 }
 
-func run(dbPath, webAddr, apiAddr string, setup bool, googleCredsPath string, oauthClients web.OAuthClientConfig) error {
+func run(dbPath, webAddr, apiAddr string, setup bool, googleCredsPath string, oauthClients web.OAuthClientConfig, approvalTTL time.Duration, approvalWebhookURL string) error {
 	// --- Keyring passphrase (BEFORE opening the DB) ---
 	// Acquire the passphrase first. When an operator opts into the fd source
 	// (SIEVE_PASSPHRASE_FD=3), opening the DB first would let SQLite grab fd 3
@@ -522,6 +535,13 @@ func run(dbPath, webAddr, apiAddr string, setup bool, googleCredsPath string, oa
 	iamSvc := iampolicies.NewService(db)
 	rolesSvc := roles.NewService(db)
 	approvalQ := approval.NewQueue(db)
+	// VPA-X01 fork: --approval-ttl (0 = off, the default) and
+	// --approval-webhook (empty = off, the default) are both no-ops when
+	// left at their defaults, so this is safe to call unconditionally.
+	approvalQ.SetTTL(approvalTTL)
+	if approvalWebhookURL != "" {
+		approvalQ.SetWebhookURL(approvalWebhookURL)
+	}
 	auditLog := audit.NewLogger(db)
 	settingsSvc := settings.NewService(db)
 
@@ -586,6 +606,34 @@ func run(dbPath, webAddr, apiAddr string, setup bool, googleCredsPath string, oa
 				return
 			case <-t.C:
 				_, _ = sessionMgr.SweepExpired()
+			}
+		}
+	}()
+
+	// Background sweep of stale pending approvals (VPA-X01 fork): without
+	// --approval-ttl set, a human might never act on a request (out of
+	// office, missed the notification, ...), leaving it "pending" forever —
+	// and, since ExpireStale is a no-op when the TTL is 0, this goroutine
+	// runs unconditionally rather than branching on whether the operator
+	// configured a TTL. 1-minute cadence (tighter than the 5-minute session
+	// sweep) since a stuck approval directly blocks an agent's in-flight
+	// request for up to 5 minutes (WaitForResolution) — the sweep should
+	// resolve well inside that window once TTL has passed.
+	approvalSweepCtx, approvalSweepCancel := context.WithCancel(context.Background())
+	defer approvalSweepCancel()
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-approvalSweepCtx.Done():
+				return
+			case <-t.C:
+				if n, err := approvalQ.ExpireStale(); err != nil {
+					log.Printf("approval TTL sweep failed: %v", err)
+				} else if n > 0 {
+					log.Printf("approval TTL sweep expired %d stale pending approval(s)", n)
+				}
 			}
 		}
 	}()
