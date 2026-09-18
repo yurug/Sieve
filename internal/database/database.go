@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -237,6 +238,37 @@ func (db *DB) migrate() error {
 
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("execute schema: %w", err)
+	}
+
+	// Additive migration (VPA-X01 fork): approval_queue gains expires_at
+	// (TTL support) and executed_at (replay-exactly-once marker). Both are
+	// nullable so existing pending/resolved rows are unaffected. Run via
+	// ALTER TABLE rather than folding into the CREATE TABLE above so a
+	// database created by an already-updated build (which has the columns)
+	// and one created by this migration's first run (which doesn't yet)
+	// both converge safely — see addColumnIgnoringDuplicate.
+	if err := addColumnIgnoringDuplicate(db, "ALTER TABLE approval_queue ADD COLUMN expires_at DATETIME"); err != nil {
+		return fmt.Errorf("migrate approval_queue.expires_at: %w", err)
+	}
+	if err := addColumnIgnoringDuplicate(db, "ALTER TABLE approval_queue ADD COLUMN executed_at DATETIME"); err != nil {
+		return fmt.Errorf("migrate approval_queue.executed_at: %w", err)
+	}
+
+	return nil
+}
+
+// addColumnIgnoringDuplicate runs an `ALTER TABLE ... ADD COLUMN ...`
+// statement unconditionally and swallows only the specific error SQLite
+// returns when the column already exists ("duplicate column name: ..."),
+// so the migration is idempotent across repeated startups without a
+// PRAGMA table_info existence check first. Any other error (bad SQL,
+// locked DB, missing table) still propagates.
+func addColumnIgnoringDuplicate(db *DB, alterSQL string) error {
+	if _, err := db.Exec(alterSQL); err != nil {
+		if strings.Contains(err.Error(), "duplicate column name") {
+			return nil
+		}
+		return err
 	}
 	return nil
 }
