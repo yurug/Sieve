@@ -21,8 +21,24 @@ RUN apt-get update && \
 
 # Install uv (fast Python package manager) and set up Python environment
 # with common packages useful for policy scripts.
+#
+# VPA-X01 drill finding #11: this whole block runs as root (USER sieve is
+# set below, AFTER this), and `uv python install` with no
+# UV_PYTHON_INSTALL_DIR resolves its default under
+# $XDG_DATA_HOME/uv/python — which, with no XDG_DATA_HOME set and $HOME=
+# /root, is /root/.local/share/uv/python/.... /opt/sieve-py/bin/python3 is
+# a symlink into that path. /root is mode 0700 (root's home directory), so
+# under `cap_drop: [ALL]` the non-root runtime user (sieve, uid 999) can't
+# traverse into /root to follow the symlink — every script-mode policy
+# fails closed with a permission error that looks like a missing
+# interpreter, not a permissions bug. Pointing UV_PYTHON_INSTALL_DIR at
+# /opt/uv-python (a path that was never under /root) fixes the traversal
+# problem outright; the explicit chown below is belt-and-suspenders in
+# case a future uv version or a different umask changes what gets created
+# where.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 ENV UV_PYTHON_PREFERENCE=managed
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 RUN uv python install 3.12 && \
     uv venv /opt/sieve-py && \
     . /opt/sieve-py/bin/activate && \
@@ -50,7 +66,8 @@ ENV PATH="/opt/sieve-py/bin:$PATH"
 # Non-root user
 RUN useradd -r -s /bin/false sieve && \
     mkdir -p /data /policies && \
-    chown sieve:sieve /data /policies
+    chown sieve:sieve /data /policies && \
+    chown -R sieve:sieve /opt/uv-python /opt/sieve-py
 
 COPY --from=builder /sieve /usr/local/bin/sieve
 
