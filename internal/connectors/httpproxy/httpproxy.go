@@ -86,6 +86,25 @@ var deniedHeaderKeys = map[string]struct{}{
 	"upgrade":             {},
 }
 
+// stripOnProxyKeys are hop-by-hop headers that the TRANSPARENT proxy
+// surface (ProxyHTTP) silently drops from the forwarded request instead of
+// rejecting the whole call with 400 (VPA-X01 drill finding #10). Connection
+// is in deniedHeaderKeys above (and stays denied-with-400 on the curated
+// Execute path's agent-supplied "headers" param, which is a deliberate
+// choice on the agent's part, not a client-library default) but every
+// Node/undici HTTP client sends `Connection: keep-alive` on outbound
+// requests BY DEFAULT — rejecting the transparent surface's first request
+// from any such client was a compatibility break, not a security boundary:
+// Connection/Proxy-Connection describe THIS leg of the connection, they
+// carry no credential and no routing-confusion risk the way Host or
+// X-Forwarded-* do. Proxy-Connection is included even though it was never
+// in deniedHeaderKeys (a legacy non-standard header some clients still
+// send) — same rationale, same treatment.
+var stripOnProxyKeys = map[string]struct{}{
+	"connection":       {},
+	"proxy-connection": {},
+}
+
 // isDeniedHeader reports whether the given header key is denied for a
 // connection whose configured auth_header is authHeaderLower (already
 // lowercased by the caller) and whose operator-extended deny-list is
@@ -670,11 +689,16 @@ func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxy
 	// Reject deny-listed inbound headers BEFORE constructing the upstream
 	// request — except Authorization, which is the agent's Sieve bearer
 	// token, present on every legitimate agent request and stripped a few
-	// lines below before forwarding. Authorization is the only deny-list
-	// entry exempted from the inbound check on the transparent surface;
-	// everything else is rejected.
+	// lines below before forwarding, and except Connection/Proxy-Connection
+	// (stripOnProxyKeys), which are dropped from the forwarded request
+	// below rather than rejected (VPA-X01 drill #10 — see stripOnProxyKeys
+	// doc comment). Every other deny-list entry is still rejected here.
 	for key := range r.Header {
 		if strings.EqualFold(key, "Authorization") {
+			continue
+		}
+		lowerKey := strings.ToLower(key)
+		if _, strip := stripOnProxyKeys[lowerKey]; strip {
 			continue
 		}
 		if denied, lower := isDeniedHeader(key, p.authHeaderLower, p.additionalDeniedLookup); denied {
@@ -704,11 +728,16 @@ func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxy
 	// value of the same param name was dropped.
 	overridden := p.injectAuthQueryParam(proxyReq.URL)
 
-	// Copy original headers (except Authorization — we substitute it, and
-	// except Accept-Encoding when filters are active so that Go's Transport
-	// handles transparent decompression, ensuring filters see plain text).
+	// Copy original headers (except Authorization — we substitute it;
+	// Connection/Proxy-Connection — stripped per stripOnProxyKeys, VPA-X01
+	// drill #10; and Accept-Encoding when filters are active so that Go's
+	// Transport handles transparent decompression, ensuring filters see
+	// plain text).
 	for key, values := range r.Header {
 		if strings.EqualFold(key, "Authorization") {
+			continue
+		}
+		if _, strip := stripOnProxyKeys[strings.ToLower(key)]; strip {
 			continue
 		}
 		if len(filters) > 0 && strings.EqualFold(key, "Accept-Encoding") {

@@ -192,7 +192,10 @@ func TestProxyHTTPRejectsDeniedHeaders(t *testing.T) {
 	defer upstream.Close()
 	pc := makeProxy(t, upstream, "x-api-key", "sk-test-12345")
 
-	for _, key := range []string{"Host", "Cookie", "X-Forwarded-For", "Connection"} {
+	// Connection is deliberately excluded from this table (VPA-X01 fork
+	// drill #10): it's stripped-and-forwarded, not denied-with-400 — see
+	// TestProxyHTTPStripsConnectionHeaders below.
+	for _, key := range []string{"Host", "Cookie", "X-Forwarded-For"} {
 		t.Run(key, func(t *testing.T) {
 			req := httptest.NewRequest("GET", "/proxy/conn/v1/anything", nil)
 			req.Header.Set("Authorization", "Bearer sieve_tok_test") // bearer carve-out
@@ -256,6 +259,47 @@ func TestProxyHTTPAuthorizationCarveOut(t *testing.T) {
 	}
 	if !hit {
 		t.Errorf("upstream was not contacted; the Authorization carve-out is broken")
+	}
+}
+
+// TestProxyHTTPStripsConnectionHeaders is the red test for VPA-X01 drill
+// finding #10: every Node/undici HTTP client sends a `Connection` header by
+// default, which made the transparent proxy 400 every such client's first
+// request (a real-world compatibility break, not a security boundary —
+// Connection is hop-by-hop metadata about THIS leg of the connection, not a
+// credential). The fix strips Connection and Proxy-Connection from the
+// forwarded request instead of rejecting the whole call; every other
+// denied header (Authorization substitution aside, Host, Cookie,
+// X-Forwarded-*, ...) still 400s per TestProxyHTTPRejectsDeniedHeaders.
+func TestProxyHTTPStripsConnectionHeaders(t *testing.T) {
+	hit := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		if got := r.Header.Get("Connection"); got != "" {
+			t.Errorf("Connection header must be stripped, got %q", got)
+		}
+		if got := r.Header.Get("Proxy-Connection"); got != "" {
+			t.Errorf("Proxy-Connection header must be stripped, got %q", got)
+		}
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+	pc := makeProxy(t, upstream, "x-api-key", "sk-real")
+
+	req := httptest.NewRequest("GET", "/proxy/conn/v1/anything", nil)
+	req.Header.Set("Authorization", "Bearer sieve_tok_test")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Proxy-Connection", "keep-alive")
+	rec := httptest.NewRecorder()
+	_, _, err := pc.ProxyHTTP(rec, req, "/v1/anything", nil)
+	if err != nil {
+		t.Fatalf("Connection/Proxy-Connection must not trigger a deny; got err=%v", err)
+	}
+	if rec.Code != 0 && rec.Code != http.StatusOK {
+		t.Errorf("expected the request to be proxied through (200), got %d", rec.Code)
+	}
+	if !hit {
+		t.Errorf("upstream was not contacted; Connection header should be stripped, not denied")
 	}
 }
 
