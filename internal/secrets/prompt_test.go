@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/trilitech/Sieve/internal/database"
 	"github.com/trilitech/Sieve/internal/secrets"
 )
 
@@ -143,23 +144,186 @@ func TestAcquire_RequireTTY_RejectsFileSource(t *testing.T) {
 	}
 }
 
-// TestAcquire_Confirm_ImpliesRequireTTY verifies Confirm=true also
-// gates on a TTY — confirming a value read from a static file is
-// meaningless, so the same TTY-required behavior applies.
-func TestAcquire_Confirm_ImpliesRequireTTY(t *testing.T) {
+// TestAcquire_Confirm_NoSource_StillRequiresTTY verifies Confirm=true still
+// gates on a TTY when NEITHER SIEVE_PASSPHRASE_FILE nor SIEVE_PASSPHRASE_FD
+// is configured — VPA-X01 fork, queue item #4 ("unattended first run")
+// changed the file/fd-configured case (see the tests below), not this one.
+// This is the literal "the interactive path still requires a TTY" case
+// from the fork's acceptance list.
+func TestAcquire_Confirm_NoSource_StillRequiresTTY(t *testing.T) {
+	t.Setenv(secrets.PassphraseFileEnv, "")
+	os.Unsetenv(secrets.PassphraseFileEnv)
+	t.Setenv(secrets.PassphraseFDEnv, "")
+	os.Unsetenv(secrets.PassphraseFDEnv)
+	closeFD3IfOpen(t)
+
+	_, err := secrets.Acquire(secrets.PromptOptions{Confirm: true})
+	if err == nil {
+		t.Fatal("expected error: Confirm=true with no source configured must still require a TTY")
+	}
+	if !strings.Contains(err.Error(), "TTY") {
+		t.Errorf("error should mention TTY, got: %v", err)
+	}
+}
+
+// TestAcquire_Confirm_FileSource_SkipsTTYAndSucceeds is the core red→green
+// test for VPA-X01 fork, queue item #4 ("unattended first run"): this is
+// the EXACT PromptOptions shape both `sieve --setup` and
+// `--rotate-passphrase`'s new-passphrase prompt use
+// (secrets.Acquire(secrets.PromptOptions{Confirm: true})) — see
+// cmd/sieve/main.go. With SIEVE_PASSPHRASE_FILE configured and no TTY
+// (as under `go test`, and as under a supervised/unattended process), it
+// must now succeed by reading the file once, rather than erroring out
+// demanding a TTY.
+func TestAcquire_Confirm_FileSource_SkipsTTYAndSucceeds(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "pp")
-	if err := os.WriteFile(path, []byte("file-source"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("unattended-setup-pp"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv(secrets.PassphraseFileEnv, path)
 
-	_, err := secrets.Acquire(secrets.PromptOptions{Confirm: true})
-	if err == nil {
-		t.Fatal("expected error: Confirm=true must imply RequireTTY")
+	got, err := secrets.Acquire(secrets.PromptOptions{Confirm: true})
+	if err != nil {
+		t.Fatalf("Confirm=true with a file source configured must succeed without a TTY: %v", err)
 	}
-	if !strings.Contains(err.Error(), "TTY") {
-		t.Errorf("error should mention TTY, got: %v", err)
+	if string(got) != "unattended-setup-pp" {
+		t.Errorf("got %q, want the file's content", got)
+	}
+}
+
+// TestAcquire_Confirm_FDSource_SkipsTTYAndSucceeds is the FD-source
+// counterpart of the file-source test above.
+func TestAcquire_Confirm_FDSource_SkipsTTYAndSucceeds(t *testing.T) {
+	t.Setenv(secrets.PassphraseFileEnv, "")
+	os.Unsetenv(secrets.PassphraseFileEnv)
+
+	openFD3Pipe(t, "unattended-fd-pp\n")
+	t.Setenv(secrets.PassphraseFDEnv, "3")
+
+	got, err := secrets.Acquire(secrets.PromptOptions{Confirm: true})
+	if err != nil {
+		t.Fatalf("Confirm=true with an fd source configured must succeed without a TTY: %v", err)
+	}
+	if string(got) != "unattended-fd-pp" {
+		t.Errorf("got %q, want the fd's content", got)
+	}
+}
+
+// TestAcquire_RotationNewPassphrase_ReadsFromFile mirrors runRotate's own
+// call sequence (cmd/sieve/main.go): a Confirm=false read for "current",
+// then a Confirm=true read for "new", against the same configured file
+// source. Proves the literal fork requirement ("the rotation path reads
+// the new passphrase from the file when provided") — the *new* read really
+// does resolve to the file's content, not an error demanding a TTY.
+//
+// Both reads necessarily return the SAME value here, since Acquire has no
+// way to distinguish "the current-passphrase call" from "the new-
+// passphrase call" — they consult the identical env var. That is not a bug
+// in this change: runRotate's existing bytes.Equal(current, newPP) guard
+// (unmodified by this fork) catches exactly this and reports "new
+// passphrase identical to current; no rotation performed" rather than
+// silently rotating a passphrase onto itself. A genuinely unattended
+// rotation to a DIFFERENT passphrase needs the operator's tooling to swap
+// what the source points at between the two reads.
+func TestAcquire_RotationNewPassphrase_ReadsFromFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pp")
+	if err := os.WriteFile(path, []byte("rotation-pp"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(secrets.PassphraseFileEnv, path)
+
+	current, err := secrets.Acquire(secrets.PromptOptions{Confirm: false, Prompt: "Current passphrase: "})
+	if err != nil {
+		t.Fatalf("read current: %v", err)
+	}
+	newPP, err := secrets.Acquire(secrets.PromptOptions{Confirm: true, Prompt: "New passphrase: "})
+	if err != nil {
+		t.Fatalf("read new (must not require a TTY when the file source is configured): %v", err)
+	}
+	if string(newPP) != "rotation-pp" {
+		t.Errorf("new passphrase = %q, want the file's content", newPP)
+	}
+	if string(current) != string(newPP) {
+		t.Errorf("current (%q) and new (%q) should both resolve to the single configured file source", current, newPP)
+	}
+}
+
+// TestUnattendedSetup_FileSource_CreatesUsableKeyring is the end-to-end
+// proof for "sieve --setup with SIEVE_PASSPHRASE_FILE set and no TTY
+// creates the keyring": chains the exact two production calls --setup
+// makes (secrets.Acquire then Keyring.Setup) and confirms the result is a
+// genuinely usable keyring (a fresh Keyring loads against the same DB with
+// the same passphrase), not just "Acquire didn't error."
+func TestUnattendedSetup_FileSource_CreatesUsableKeyring(t *testing.T) {
+	dir := t.TempDir()
+	ppPath := filepath.Join(dir, "pp")
+	if err := os.WriteFile(ppPath, []byte("unattended-first-run-pp"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(secrets.PassphraseFileEnv, ppPath)
+
+	// The exact call cmd/sieve's run() makes for --setup.
+	pp, err := secrets.Acquire(secrets.PromptOptions{Confirm: true})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	db, err := database.New(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	saved := secrets.DefaultArgon2Params
+	secrets.DefaultArgon2Params = secrets.Argon2Params{Time: 1, Memory: 8, Threads: 1, KeyLen: 32}
+	t.Cleanup(func() { secrets.DefaultArgon2Params = saved })
+
+	k := &secrets.Keyring{}
+	if err := k.Setup(db.DB, pp); err != nil {
+		t.Fatalf("keyring setup with the unattended passphrase: %v", err)
+	}
+
+	k2 := &secrets.Keyring{}
+	if err := k2.Load(db.DB, pp); err != nil {
+		t.Fatalf("load the keyring created via unattended setup: %v", err)
+	}
+}
+
+// TestUnattendedSetup_FDSource_CreatesUsableKeyring is the FD-source
+// counterpart of the file-source end-to-end test above.
+func TestUnattendedSetup_FDSource_CreatesUsableKeyring(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(secrets.PassphraseFileEnv, "")
+	os.Unsetenv(secrets.PassphraseFileEnv)
+
+	openFD3Pipe(t, "unattended-fd-first-run-pp\n")
+	t.Setenv(secrets.PassphraseFDEnv, "3")
+
+	pp, err := secrets.Acquire(secrets.PromptOptions{Confirm: true})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	db, err := database.New(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	saved := secrets.DefaultArgon2Params
+	secrets.DefaultArgon2Params = secrets.Argon2Params{Time: 1, Memory: 8, Threads: 1, KeyLen: 32}
+	t.Cleanup(func() { secrets.DefaultArgon2Params = saved })
+
+	k := &secrets.Keyring{}
+	if err := k.Setup(db.DB, pp); err != nil {
+		t.Fatalf("keyring setup with the unattended passphrase: %v", err)
+	}
+
+	k2 := &secrets.Keyring{}
+	if err := k2.Load(db.DB, pp); err != nil {
+		t.Fatalf("load the keyring created via unattended setup: %v", err)
 	}
 }
 

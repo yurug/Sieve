@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -31,25 +32,32 @@ const PassphraseFDEnv = "SIEVE_PASSPHRASE_FD"
 
 // PromptOptions controls how Acquire reads the passphrase.
 type PromptOptions struct {
-	// Confirm, when true, prompts twice and verifies the two entries match.
-	// First-run setup uses this; routine startup does not.
-	// Confirm=true implies RequireTTY=true (you can't "confirm" a value
-	// read from a static file or FD).
+	// Confirm, when true, means the caller is capturing a NEW passphrase
+	// that needs double-entry verification against typos — first-run
+	// setup (--setup) and --rotate-passphrase's new-passphrase prompt both
+	// set this. When a machine-provided source (SIEVE_PASSPHRASE_FILE or
+	// SIEVE_PASSPHRASE_FD) is configured, Confirm no longer forces a TTY
+	// (VPA-X01 fork, queue item #4 "unattended first run"): a static
+	// value can't be mistyped, so a single read of that source stands in
+	// for both the passphrase and its confirmation, and Acquire logs one
+	// line naming which source it used (never the value). Confirm only
+	// falls back to requiring a TTY when NEITHER source is configured —
+	// see RequireTTY below for the unconditional escape hatch.
 	Confirm bool
 
 	// Prompt is the human-facing label printed before the read. Defaults
 	// to "Sieve passphrase: ".
 	Prompt string
 
-	// RequireTTY, when true, skips SIEVE_PASSPHRASE_FILE and
-	// SIEVE_PASSPHRASE_FD and reads only from the TTY. The CLI flows that capture a *new*
-	// passphrase (--setup, --rotate-passphrase's second prompt) set
-	// this. Without it, running --rotate-passphrase with the file
-	// source configured would re-read the same file twice (current
-	// and new), make rotation a no-op, and trip the
-	// "new identical to current" guard. Acquire errors out if stdin
-	// is not a TTY rather than falling back. Confirm=true implies
-	// RequireTTY=true.
+	// RequireTTY, when true, unconditionally skips SIEVE_PASSPHRASE_FILE
+	// and SIEVE_PASSPHRASE_FD and reads only from the TTY, regardless of
+	// Confirm or whether a source is configured. No current caller sets
+	// this explicitly — it exists as an escape hatch for a future flow
+	// that must never accept a machine-provided source even when Confirm
+	// would otherwise allow one (e.g. two prompts in the same run, like
+	// --rotate-passphrase's current+new pair, that must not silently both
+	// resolve to the same static source). Acquire errors out if stdin is
+	// not a TTY rather than falling back.
 	RequireTTY bool
 }
 
@@ -64,53 +72,90 @@ func IsStdinTerminal() bool {
 }
 
 // Acquire reads a passphrase using the documented priority order:
-// 1. If SIEVE_PASSPHRASE_FILE is set → read that file. Takes precedence
+// 1. If RequireTTY is set → TTY only, unconditionally (see PromptOptions).
+// 2. Else if Confirm is set AND a machine-provided source is configured →
+// read that source ONCE and use it as both the passphrase and its
+// confirmation (VPA-X01 fork, queue item #4 "unattended first run": a
+// static value can't be mistyped, so there is nothing to confirm against).
+// One line is logged naming which source satisfied the prompt — never the
+// value. This is what lets --setup and --rotate-passphrase's new-passphrase
+// prompt run without a TTY.
+// 3. Else if Confirm is set (and neither source is configured) → TTY only,
+// prompting twice and verifying the two entries match. This is the ONLY
+// remaining case that forces a TTY when Confirm is set — the case this
+// fork changes is #2 above.
+// 4. Else if SIEVE_PASSPHRASE_FILE is set → read that file. Takes precedence
 // over the TTY prompt so that operators who've wired up a credential
 // file (systemd LoadCredential=, container secret mount, etc.) aren't
 // re-prompted on every start. If the path starts with /run/secrets or
 // is otherwise an ephemeral mount the operator manages, the file is
 // *not* deleted; it's the operator's responsibility. Reading it once
 // into memory is enough.
-// 2. Else if SIEVE_PASSPHRASE_FD names an open fd → read that descriptor
+// 5. Else if SIEVE_PASSPHRASE_FD names an open fd → read that descriptor
 // until EOF. OPT-IN only: the operator explicitly designates the fd, so a
 // descriptor leaked/inherited from a launcher (terminal, IDE, tmux, CI)
 // can never silently hijack intake. A named-but-unreadable fd is a loud
 // error, not a fallthrough.
-// 3. Else if stdin is a TTY → prompt with echo off (golang.org/x/term).
-// 4. Else → return an error so startup fails loudly.
+// 6. Else if stdin is a TTY → prompt with echo off (golang.org/x/term).
+// 7. Else → return an error so startup fails loudly.
 // Environment variables (other than the file/fd pointers, which name a
 // *location*, not the secret) are deliberately not supported — env leaks
 // through /proc/<pid>/environ, ps, and crash dumps. If you need to plumb a
 // passphrase from CI, write it to a file and point SIEVE_PASSPHRASE_FILE at it.
-// Note: opts.Confirm is only meaningful when the read happens on a TTY.
-// Confirm=true implies opts.RequireTTY=true (below), so when Confirm is
-// set Acquire never reaches the file or FD 3 branches.
 //
-// opts.RequireTTY (implied by opts.Confirm) forces the TTY path: file
-// and FD 3 are skipped and Acquire errors out if stdin is not a TTY.
-// Callers capturing a *new* passphrase (--setup, --rotate-passphrase's
-// second prompt) must set this; otherwise a configured file source
-// would silently feed both the "current" and "new" reads in rotation,
-// making the operation a no-op. See cmd/sieve/main.go for the wiring.
+// Rotation caveat: --rotate-passphrase reads a "current" then a "new"
+// passphrase in the same run (see cmd/sieve/main.go). Both calls consult the
+// SAME env vars, so if the operator's automation sets SIEVE_PASSPHRASE_FILE
+// (or _FD) for an unattended rotation, "current" and "new" resolve to the
+// identical value — main.go's existing bytes.Equal(current, newPP) guard
+// then correctly reports "no rotation performed" rather than silently
+// rotating a passphrase onto itself. A genuinely unattended rotation to a
+// DIFFERENT passphrase needs the operator's tooling to swap what the source
+// points at between the two reads (or set RequireTTY on the "new" call to
+// force an interactive override) — this fork does not add a second,
+// distinctly-named "new passphrase" source.
 func Acquire(opts PromptOptions) ([]byte, error) {
 	prompt := opts.Prompt
 	if prompt == "" {
 		prompt = "Sieve passphrase: "
 	}
 
-	if opts.RequireTTY || opts.Confirm {
+	if opts.RequireTTY {
 		if !IsStdinTerminal() {
 			return nil, errors.New("this passphrase prompt requires a TTY: " +
-				"stdin is not interactive (both --setup and " +
-				"--rotate-passphrase's new-passphrase prompt only accept a " +
-				"typed value). Re-run from an interactive shell. " +
-				"Neither " + PassphraseFileEnv + " nor " + PassphraseFDEnv +
-				" influences this " +
-				"branch — even when configured, those sources are skipped " +
-				"here so that an unattended file source cannot silently " +
-				"satisfy a confirmation or rotation new-passphrase prompt.")
+				"stdin is not interactive, and RequireTTY on this call " +
+				"means neither " + PassphraseFileEnv + " nor " + PassphraseFDEnv +
+				" is consulted no matter what — re-run from an interactive shell.")
 		}
 		return acquireTTY(prompt, opts.Confirm)
+	}
+
+	if opts.Confirm {
+		if path := os.Getenv(PassphraseFileEnv); path != "" {
+			pp, err := acquireFile(path)
+			if err != nil {
+				return nil, err
+			}
+			log.Printf("sieve: passphrase for this confirm prompt read from %s (value never logged)", PassphraseFileEnv)
+			return pp, nil
+		}
+		if fdStr := os.Getenv(PassphraseFDEnv); fdStr != "" {
+			pp, err := acquirePassphraseFD(fdStr)
+			if err != nil {
+				return nil, err
+			}
+			log.Printf("sieve: passphrase for this confirm prompt read from %s (value never logged)", PassphraseFDEnv)
+			return pp, nil
+		}
+		if !IsStdinTerminal() {
+			return nil, errors.New("this passphrase prompt requires a TTY: " +
+				"stdin is not interactive and neither " + PassphraseFileEnv +
+				" nor " + PassphraseFDEnv + " is set. Re-run from an " +
+				"interactive shell, or set one of those two to supply the " +
+				"passphrase unattended (a single read then stands in for " +
+				"both the value and its confirmation).")
+		}
+		return acquireTTY(prompt, true)
 	}
 
 	if path := os.Getenv(PassphraseFileEnv); path != "" {
