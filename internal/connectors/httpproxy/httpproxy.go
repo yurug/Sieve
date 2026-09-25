@@ -646,6 +646,13 @@ func validateProxyPath(proxyPath string) (string, error) {
 	if !strings.HasPrefix(cleaned, "/") {
 		return "", fmt.Errorf("path escapes root directory")
 	}
+	// path.Clean drops a trailing slash, but many upstreams treat "/x/" and "/x" as different
+	// resources: PyPI answers /simple/<name> with a 301 to /simple/<name>/, so without this every
+	// PEP 503 index request through the proxy loops on its own redirect (VPA-X01, 2026-09-25).
+	// A trailing slash adds no traversal power; keep it.
+	if strings.HasSuffix(decoded, "/") && cleaned != "/" {
+		cleaned += "/"
+	}
 
 	return cleaned, nil
 }
