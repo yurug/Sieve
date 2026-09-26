@@ -381,7 +381,7 @@ namespace Sieve {
   action "google/send_email" in ["google/gmail.write"] appliesTo {
     principal: [Sieve::Token],
     resource: [Sieve::Connection],
-    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "bcc"?: Set<String>, "body"?: String, "cc"?: Set<String>, "in_reply_to"?: String, "in_reply_to_message_id"?: String, "references"?: String, "reply_to"?: String, "subject"?: String, "thread_id"?: String, "to"?: Set<String> } }
+    context: { "http_method"?: String, "recipient_domains"?: Set<String>, "estimated_cost"?: Long, "param"?: { "attachments"?: String, "bcc"?: Set<String>, "body"?: String, "cc"?: Set<String>, "in_reply_to"?: String, "in_reply_to_message_id"?: String, "references"?: String, "reply_to"?: String, "subject"?: String, "thread_id"?: String, "to"?: Set<String> } }
   };
   action "google/sheets.create_spreadsheet" in ["google/sheets.write"] appliesTo {
     principal: [Sieve::Token],

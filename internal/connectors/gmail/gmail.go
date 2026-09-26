@@ -20,6 +20,7 @@ package gmail
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -499,6 +500,11 @@ var operations = []connector.OperationDef{
 			"in_reply_to":            {Type: "string", Description: "Parent RFC5322 Message-ID for the In-Reply-To header (advanced)", Required: false},
 			"references":             {Type: "string", Description: "RFC5322 References chain (advanced)", Required: false},
 			"reply_to":               {Type: "string", Description: "DEPRECATED legacy alias; use in_reply_to_message_id", Required: false},
+			"attachments": {
+				Type:        "[]object",
+				Description: fmt.Sprintf("Files to attach, each {filename, mime_type, content_base64}. content_base64 is the raw file bytes, base64-encoded — never a path or URL. At most %d attachments, %d bytes total decoded.", maxAttachmentCount, maxAttachmentsTotalBytes),
+				Required:    false,
+			},
 		},
 		ReadOnly: false,
 	},
@@ -885,13 +891,18 @@ func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[str
 		return g.client.UpdateDraft(ctx, draftID, req)
 
 	case "send_email":
+		attachments, err := parseAttachmentsParam(params)
+		if err != nil {
+			return nil, err
+		}
 		req := gmailclient.DraftRequest{
-			To:      getStringSliceParam(params, "to"),
-			Cc:      getStringSliceParam(params, "cc"),
-			Bcc:     getStringSliceParam(params, "bcc"),
-			Subject: getStringParam(params, "subject"),
-			Body:    getStringParam(params, "body"),
-			ReplyTo: getStringParam(params, "reply_to"),
+			To:          getStringSliceParam(params, "to"),
+			Cc:          getStringSliceParam(params, "cc"),
+			Bcc:         getStringSliceParam(params, "bcc"),
+			Subject:     getStringParam(params, "subject"),
+			Body:        getStringParam(params, "body"),
+			ReplyTo:     getStringParam(params, "reply_to"),
+			Attachments: attachments,
 		}
 		if err := g.applyThreading(ctx, params, &req); err != nil {
 			return nil, err
@@ -1410,4 +1421,100 @@ func getBoolParam(params map[string]any, key string) bool {
 	default:
 		return false
 	}
+}
+
+// maxAttachmentCount and maxAttachmentsTotalBytes cap send_email's attachments
+// param. 25 MB matches Gmail's own outbound attachment ceiling (a larger
+// decoded payload would just be rejected by the Gmail API anyway); 10 files
+// is a generous margin over normal usage. Both are enforced by
+// parseAttachmentsParam before any Gmail API call is made.
+const (
+	maxAttachmentCount       = 10
+	maxAttachmentsTotalBytes = 25 * 1024 * 1024
+)
+
+// parseAttachmentsParam parses and validates the wire-format "attachments"
+// param into decoded gmailclient.OutgoingAttachment values. The wire shape
+// (fixed by the calling webapp) is an array of
+// {filename, mime_type, content_base64} objects. Returns (nil, nil) when the
+// param is absent or an empty array — send_email's no-attachment behavior is
+// unaffected.
+//
+// The only source of attachment bytes is the inline content_base64 field —
+// there is deliberately no path/URL variant, so this can never be used to
+// read an arbitrary file off the host. filename is rejected if it contains a
+// path separator or "..": even though it is never used as a filesystem path,
+// keeping it a plain leaf name is defense in depth. filename and mime_type
+// are also rejected if they contain CR or LF, since both are written
+// verbatim into email headers (Content-Disposition / Content-Type) and an
+// embedded newline would allow header injection.
+func parseAttachmentsParam(params map[string]any) ([]gmailclient.OutgoingAttachment, error) {
+	raw, ok := params["attachments"]
+	if !ok || raw == nil {
+		return nil, nil
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("attachments: expected an array of objects")
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	if len(items) > maxAttachmentCount {
+		return nil, fmt.Errorf("attachments: at most %d attachments allowed, got %d", maxAttachmentCount, len(items))
+	}
+
+	out := make([]gmailclient.OutgoingAttachment, 0, len(items))
+	totalBytes := 0
+	for i, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("attachments[%d]: expected an object", i)
+		}
+
+		filename, _ := item["filename"].(string)
+		mimeType, _ := item["mime_type"].(string)
+		contentB64, _ := item["content_base64"].(string)
+
+		if filename == "" {
+			return nil, fmt.Errorf("attachments[%d]: filename is required", i)
+		}
+		if strings.ContainsAny(filename, "/\\") || strings.Contains(filename, "..") {
+			return nil, fmt.Errorf("attachments[%d]: filename %q must not contain a path separator or \"..\"", i, filename)
+		}
+		if strings.ContainsAny(filename, "\r\n") {
+			return nil, fmt.Errorf("attachments[%d]: filename must not contain CR or LF", i)
+		}
+		if mimeType == "" {
+			return nil, fmt.Errorf("attachments[%d]: mime_type is required", i)
+		}
+		if strings.ContainsAny(mimeType, "\r\n") {
+			return nil, fmt.Errorf("attachments[%d]: mime_type must not contain CR or LF", i)
+		}
+		if contentB64 == "" {
+			return nil, fmt.Errorf("attachments[%d]: content_base64 is required", i)
+		}
+
+		data, err := base64.StdEncoding.DecodeString(contentB64)
+		if err != nil {
+			// Accept the unpadded/raw variant too (base64.RawStdEncoding) —
+			// some clients omit padding — before giving up.
+			data, err = base64.RawStdEncoding.DecodeString(contentB64)
+			if err != nil {
+				return nil, fmt.Errorf("attachments[%d]: content_base64 is not valid base64: %w", i, err)
+			}
+		}
+
+		totalBytes += len(data)
+		if totalBytes > maxAttachmentsTotalBytes {
+			return nil, fmt.Errorf("attachments: total attachment size exceeds the %d byte cap", maxAttachmentsTotalBytes)
+		}
+
+		out = append(out, gmailclient.OutgoingAttachment{
+			Filename: filename,
+			MimeType: mimeType,
+			Data:     data,
+		})
+	}
+	return out, nil
 }

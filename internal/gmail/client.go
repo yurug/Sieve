@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"fmt"
 	"mime"
+	"mime/multipart"
 	"net/mail"
+	"net/textproto"
 	"strings"
 	"time"
 
@@ -78,6 +80,17 @@ type Label struct {
 	Type string `json:"type"`
 }
 
+// OutgoingAttachment is a single file to attach to an outgoing message.
+// Data is already-decoded raw bytes: callers (gmail.go's parseAttachmentsParam)
+// are responsible for validating Filename/MimeType and base64-decoding the
+// wire-format content_base64 field before constructing this. buildMIMEMessage
+// trusts Filename and MimeType to already be free of CR/LF/path separators.
+type OutgoingAttachment struct {
+	Filename string
+	MimeType string
+	Data     []byte
+}
+
 // DraftRequest contains the fields needed to create or update a draft.
 type DraftRequest struct {
 	To      []string `json:"to"`
@@ -85,6 +98,13 @@ type DraftRequest struct {
 	Bcc     []string `json:"bcc,omitempty"`
 	Subject string   `json:"subject"`
 	Body    string   `json:"body"`
+
+	// Attachments, when non-empty, makes buildMIMEMessage emit a
+	// multipart/mixed message (a text part plus one part per attachment)
+	// instead of the plain single-part message. Only send_email populates
+	// this today (see gmail.go's Execute); CreateDraft/UpdateDraft callers
+	// leave it nil and are byte-for-byte unaffected.
+	Attachments []OutgoingAttachment `json:"-"`
 
 	// ReplyTo is the LEGACY threading field: a Gmail message id that was
 	// (incorrectly) used both as the draft's threadId and as the In-Reply-To
@@ -791,13 +811,20 @@ func isASCII(s string) bool {
 	return true
 }
 
-// buildMIMEMessage creates an RFC 2822 message from a DraftRequest.
+// buildMIMEMessage creates an RFC 2822 message from a DraftRequest. With no
+// attachments this is the original single-part text/plain builder, unchanged
+// byte-for-byte. With attachments it delegates to buildMultipartMIMEMessage.
 func buildMIMEMessage(req DraftRequest) ([]byte, error) {
-	var buf strings.Builder
+	if len(req.Attachments) == 0 {
+		return buildSimpleMIMEMessage(req), nil
+	}
+	return buildMultipartMIMEMessage(req)
+}
 
-	buf.WriteString("MIME-Version: 1.0\r\n")
-	buf.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
-
+// writeCommonHeaders writes the header lines shared by both the simple and
+// multipart builders (everything except Content-Type, which each caller
+// writes itself since the value differs: text/plain vs multipart/mixed).
+func writeCommonHeaders(buf *strings.Builder, req DraftRequest) {
 	if len(req.To) > 0 {
 		buf.WriteString(fmt.Sprintf("To: %s\r\n", encodeAddressList(req.To)))
 	}
@@ -829,9 +856,100 @@ func buildMIMEMessage(req DraftRequest) ([]byte, error) {
 	if references != "" {
 		buf.WriteString(fmt.Sprintf("References: %s\r\n", normalizeMessageIDs(references)))
 	}
+}
+
+// buildSimpleMIMEMessage is the original no-attachment builder, kept verbatim
+// so its output stays byte-for-byte identical to before attachment support
+// was added (regression-tested in gmail_test.go).
+func buildSimpleMIMEMessage(req DraftRequest) []byte {
+	var buf strings.Builder
+
+	buf.WriteString("MIME-Version: 1.0\r\n")
+	buf.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
+
+	writeCommonHeaders(&buf, req)
 
 	buf.WriteString("\r\n")
 	buf.WriteString(req.Body)
+
+	return []byte(buf.String())
+}
+
+// base64LineLength is RFC 2045 §6.8's line-length cap for base64-encoded body
+// content (76 characters, not counting the terminating CRLF).
+const base64LineLength = 76
+
+// quotedHeaderParamValue renders s as an RFC 5322 quoted-string suitable for
+// a header parameter value (e.g. Content-Disposition's filename="..."),
+// escaping embedded backslashes and double quotes. Callers must already have
+// rejected CR/LF in s (see parseAttachmentsParam) — this only guards the
+// quoting syntax itself, not header injection.
+func quotedHeaderParamValue(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		if r == '"' || r == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// buildMultipartMIMEMessage builds a multipart/mixed RFC 2822 message: one
+// text/plain part for the body, then one part per attachment (Content-Type
+// set to the attachment's mime type, Content-Transfer-Encoding: base64,
+// Content-Disposition: attachment). It reuses mime/multipart for correct
+// boundary generation/escaping and net/textproto for header formatting.
+func buildMultipartMIMEMessage(req DraftRequest) ([]byte, error) {
+	var buf strings.Builder
+
+	buf.WriteString("MIME-Version: 1.0\r\n")
+	writeCommonHeaders(&buf, req)
+
+	mpw := multipart.NewWriter(&buf)
+	buf.WriteString(fmt.Sprintf("Content-Type: multipart/mixed; boundary=%s\r\n", quotedHeaderParamValue(mpw.Boundary())))
+	buf.WriteString("\r\n")
+
+	textPart, err := mpw.CreatePart(textproto.MIMEHeader{
+		"Content-Type": {`text/plain; charset="UTF-8"`},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gmail: writing message body part: %w", err)
+	}
+	if _, err := textPart.Write([]byte(req.Body)); err != nil {
+		return nil, fmt.Errorf("gmail: writing message body part: %w", err)
+	}
+
+	for _, att := range req.Attachments {
+		header := textproto.MIMEHeader{
+			"Content-Type":              {att.MimeType},
+			"Content-Transfer-Encoding": {"base64"},
+			"Content-Disposition":       {fmt.Sprintf("attachment; filename=%s", quotedHeaderParamValue(att.Filename))},
+		}
+		part, err := mpw.CreatePart(header)
+		if err != nil {
+			return nil, fmt.Errorf("gmail: writing attachment part for %q: %w", att.Filename, err)
+		}
+		encoded := base64.StdEncoding.EncodeToString(att.Data)
+		for i := 0; i < len(encoded); i += base64LineLength {
+			end := i + base64LineLength
+			if end > len(encoded) {
+				end = len(encoded)
+			}
+			if _, err := part.Write([]byte(encoded[i:end])); err != nil {
+				return nil, fmt.Errorf("gmail: writing attachment part for %q: %w", att.Filename, err)
+			}
+			if _, err := part.Write([]byte("\r\n")); err != nil {
+				return nil, fmt.Errorf("gmail: writing attachment part for %q: %w", att.Filename, err)
+			}
+		}
+	}
+
+	if err := mpw.Close(); err != nil {
+		return nil, fmt.Errorf("gmail: closing multipart message: %w", err)
+	}
 
 	return []byte(buf.String()), nil
 }
