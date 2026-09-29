@@ -52,6 +52,15 @@ var → build-time default** (Google's `defaultGoogleClientID`, injectable with
 `-ldflags` at release time). Full flag list:
 [CLI reference → OAuth app client flags](cli-reference.md#oauth-app-client-flags).
 
+The `google` connection add and reauth forms also accept a closed
+`oauth_profile=gmail` value. It requests only `gmail.modify`; an omitted profile
+retains the historical six-service request. The chosen profile is bound to the
+pending state and stored with the encrypted connection config. Ordinary reauth
+reuses that stored profile; an explicit Gmail reauth can request a narrower
+scope set for an older connection. Sieve records the token endpoint's granted
+scope separately and refuses a Gmail grant missing `gmail.modify`. This does
+not revoke any older Google grant.
+
 ## Per-provider status
 
 | Provider | PKCE | Notes |

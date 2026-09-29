@@ -62,6 +62,12 @@ var Meta = connector.ConnectorMeta{
 			HelpText: "Google OAuth client_id used to refresh the access token. Copied from the application's client_secret*.json at connection-creation time; declared here for the architecture test."},
 		{Name: "client_secret", Label: "OAuth client_secret", Type: "password", Editable: false, EditOnly: true, Secret: true,
 			HelpText: "Google OAuth client_secret used to refresh the access token. Same source as client_id."},
+		{Name: "oauth_profile", Label: "OAuth profile", Type: "text", Editable: false, EditOnly: true,
+			HelpText: "Closed scope profile chosen by the OAuth start flow, not directly editable."},
+		{Name: "oauth_granted_scopes", Label: "Granted OAuth scopes", Type: "text", Editable: false, EditOnly: true,
+			HelpText: "Scopes reported by Google, or the requested scopes if omitted under RFC 6749 section 5.1."},
+		{Name: "oauth_scopes_source", Label: "OAuth scope provenance", Type: "text", Editable: false, EditOnly: true,
+			HelpText: "Whether the scope list came from Google's token response or the bound request."},
 	},
 	Operations: operations,
 	// recipient_domains is populated by GoogleConnector.EnrichContext for the
@@ -317,7 +323,7 @@ func (g *GoogleConnector) Type() string {
 // are NOT persisted — they're function-typed callbacks set at runtime by
 // connections.Service and round-tripped via separate plumbing.
 func (g *GoogleConnector) ConfigSchemaKeys() []string {
-	return []string{"email", "oauth_token", "client_id", "client_secret"}
+	return []string{"email", "oauth_token", "client_id", "client_secret", "oauth_profile", "oauth_granted_scopes", "oauth_scopes_source"}
 }
 
 // Operations returns the list of supported Gmail operations.

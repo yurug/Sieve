@@ -105,6 +105,7 @@ type Server struct {
 	webAddr               string // host:port the admin UI listens on (Origin allow-list)
 	templates             map[string]*template.Template
 	googleCredentialsFile string
+	googleProfileLookup   func(*oauth2.Config, *oauth2.Token) (string, error) // test seam for Google's profile API
 
 	// oauthClients holds the shipped/launch-configured OAuth app client IDs
 	// (and, where applicable, non-confidential secrets) for providers whose
@@ -881,6 +882,7 @@ type pendingOAuth struct {
 	IsReauth            bool
 	OperatorSessionHash string // hex(sha256(cookie value)); empty when no session was active
 	CodeVerifier        string // PKCE (RFC 7636) verifier; only its S256 challenge left this process. See pkce.go.
+	GoogleProfile       string // closed scope set; empty means the historical general profile
 
 	// GoogleClientID / GoogleClientSecret carry the per-connection Google OAuth
 	// client chosen for THIS install (empty ⇒ use the server's global client).
@@ -987,13 +989,18 @@ func (s *Server) handleConnectionAdd(w http.ResponseWriter, r *http.Request) {
 	// after receiving valid credentials. This avoids orphaned connections that
 	// appear in the UI but have no working credentials.
 	if connectorType == "google" {
+		profile, err := googleOAuthProfile(r.FormValue("oauth_profile"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		// Optional per-connection OAuth client (e.g. this org's Internal-app
 		// client, pasted from its credentials.json). Empty ⇒ use the server's
 		// global client. Lets one instance serve multiple Workspace orgs.
 		gClientID := strings.TrimSpace(r.FormValue("google_client_id"))
 		gClientSecret := strings.TrimSpace(r.FormValue("google_client_secret"))
 
-		conf, err := s.googleOAuthConfigFor(r, gClientID, gClientSecret)
+		conf, err := s.googleOAuthConfigForProfile(r, gClientID, gClientSecret, profile)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -1015,6 +1022,7 @@ func (s *Server) handleConnectionAdd(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:           time.Now(),
 			OperatorSessionHash: operatorSessionHash(r),
 			CodeVerifier:        verifier,
+			GoogleProfile:       profile,
 			GoogleClientID:      gClientID,
 			GoogleClientSecret:  gClientSecret,
 		}
@@ -1086,8 +1094,17 @@ func (s *Server) handleConnectionReauth(w http.ResponseWriter, r *http.Request) 
 		gClientID, _ = conn.Config["client_id"].(string)
 		gClientSecret, _ = conn.Config["client_secret"].(string)
 	}
+	savedProfile, _ := conn.Config["oauth_profile"].(string)
+	if requested := r.FormValue("oauth_profile"); requested != "" {
+		savedProfile = requested
+	}
+	profile, err := googleOAuthProfile(savedProfile)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	conf, err := s.googleOAuthConfigFor(r, gClientID, gClientSecret)
+	conf, err := s.googleOAuthConfigForProfile(r, gClientID, gClientSecret, profile)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1110,6 +1127,7 @@ func (s *Server) handleConnectionReauth(w http.ResponseWriter, r *http.Request) 
 		IsReauth:            true,
 		OperatorSessionHash: operatorSessionHash(r),
 		CodeVerifier:        verifier,
+		GoogleProfile:       profile,
 		GoogleClientID:      gClientID,
 		GoogleClientSecret:  gClientSecret,
 	}
@@ -1316,7 +1334,12 @@ func (s *Server) googleOAuthConfig(r *http.Request) (*oauth2.Config, error) {
 // a PKCE public client (see pkce.go), though Google token refresh generally
 // needs the (non-confidential) Desktop secret.
 func (s *Server) googleOAuthConfigFor(r *http.Request, clientID, clientSecret string) (*oauth2.Config, error) {
+	return s.googleOAuthConfigForProfile(r, clientID, clientSecret, googleProfileGeneral)
+}
+
+func (s *Server) googleOAuthConfigForProfile(r *http.Request, clientID, clientSecret, profile string) (*oauth2.Config, error) {
 	redirectURL := s.publicBaseURL(r) + "/oauth/callback"
+	scopes := googleOAuthScopesFor(profile)
 
 	// Per-connection client wins: this connection was created against (or is
 	// re-authing against) a specific GCP project's OAuth client.
@@ -1324,7 +1347,7 @@ func (s *Server) googleOAuthConfigFor(r *http.Request, clientID, clientSecret st
 		return &oauth2.Config{
 			ClientID:     clientID,
 			ClientSecret: clientSecret,
-			Scopes:       googleOAuthScopes,
+			Scopes:       scopes,
 			Endpoint:     google.Endpoint,
 			RedirectURL:  redirectURL,
 		}, nil
@@ -1335,7 +1358,7 @@ func (s *Server) googleOAuthConfigFor(r *http.Request, clientID, clientSecret st
 		return &oauth2.Config{
 			ClientID:     id,
 			ClientSecret: s.googleOAuthClientSecret(),
-			Scopes:       googleOAuthScopes,
+			Scopes:       scopes,
 			Endpoint:     google.Endpoint,
 			RedirectURL:  redirectURL,
 		}, nil
@@ -1349,7 +1372,7 @@ func (s *Server) googleOAuthConfigFor(r *http.Request, clientID, clientSecret st
 	if err != nil {
 		return nil, fmt.Errorf("read credentials file: %w", err)
 	}
-	conf, err := google.ConfigFromJSON(data, googleOAuthScopes...)
+	conf, err := google.ConfigFromJSON(data, scopes...)
 	if err != nil {
 		return nil, fmt.Errorf("parse credentials file: %w", err)
 	}
@@ -1417,7 +1440,12 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	// Use the same OAuth client this flow started with (per-connection when set,
 	// else the global client) so the exchange and the persisted refresh client
 	// match what the authorize step used.
-	conf, err := s.googleOAuthConfigFor(r, pending.GoogleClientID, pending.GoogleClientSecret)
+	oauthProfile, err := googleOAuthProfile(pending.GoogleProfile)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	conf, err := s.googleOAuthConfigForProfile(r, pending.GoogleClientID, pending.GoogleClientSecret, oauthProfile)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1435,15 +1463,21 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("token exchange failed: %v", err), http.StatusInternalServerError)
 		return
 	}
-
-	// Use the token to get the user's email address from Gmail.
-	svc, err := googleapi.NewService(context.Background(), option.WithTokenSource(conf.TokenSource(context.Background(), token)))
+	var requiredScopes []string
+	if oauthProfile == googleProfileGmail {
+		requiredScopes = conf.Scopes
+	}
+	granted, scopeSource, err := googleGrantedScopes(token, conf.Scopes, requiredScopes)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to create gmail service: %v", err), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 
-	profile, err := svc.Users.GetProfile("me").Do()
+	lookup := s.googleProfileLookup
+	if lookup == nil {
+		lookup = googleEmailFromProfile
+	}
+	email, err := lookup(conf, token)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to get gmail profile: %v", err), http.StatusInternalServerError)
 		return
@@ -1459,10 +1493,13 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		tokenMap["expiry"] = token.Expiry.Format(time.RFC3339)
 	}
 	connConfig := map[string]any{
-		"email":         profile.EmailAddress,
-		"oauth_token":   tokenMap,
-		"client_id":     conf.ClientID,
-		"client_secret": conf.ClientSecret,
+		"email":                email,
+		"oauth_token":          tokenMap,
+		"client_id":            conf.ClientID,
+		"client_secret":        conf.ClientSecret,
+		"oauth_profile":        oauthProfile,
+		"oauth_granted_scopes": granted,
+		"oauth_scopes_source":  scopeSource,
 	}
 
 	// Commit point. For a fresh add, INSERT; for a re-auth, UPDATE the
@@ -1481,9 +1518,21 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("re-auth: load existing connection: %v", gerr), http.StatusInternalServerError)
 			return
 		}
-		if err := matchesReauthIdentity(existing, profile.EmailAddress); err != nil {
+		if err := matchesReauthIdentity(existing, email); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		if token.RefreshToken == "" {
+			oldClient, _ := existing.Config["client_id"].(string)
+			if oldClient != conf.ClientID {
+				http.Error(w, "Google OAuth returned no refresh token for the new client; existing connection unchanged", http.StatusBadRequest)
+				return
+			}
+			if old, ok := existing.Config["oauth_token"].(map[string]any); ok {
+				if refresh, ok := old["refresh_token"].(string); ok {
+					tokenMap["refresh_token"] = refresh
+				}
+			}
 		}
 		if err := s.connections.UpdateConfig(pending.ID, connConfig); err != nil {
 			s.writeConnectionError(w, http.StatusInternalServerError, fmt.Sprintf("failed to update connection: %v", err), err)
@@ -1496,7 +1545,19 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	http.Redirect(w, r, googleOAuthSuccessRedirect(pending.ID, profile.EmailAddress), http.StatusSeeOther)
+	http.Redirect(w, r, googleOAuthSuccessRedirect(pending.ID, email), http.StatusSeeOther)
+}
+
+func googleEmailFromProfile(conf *oauth2.Config, token *oauth2.Token) (string, error) {
+	svc, err := googleapi.NewService(context.Background(), option.WithTokenSource(conf.TokenSource(context.Background(), token)))
+	if err != nil {
+		return "", err
+	}
+	profile, err := svc.Users.GetProfile("me").Do()
+	if err != nil {
+		return "", err
+	}
+	return profile.EmailAddress, nil
 }
 
 // googleOAuthSuccessRedirect builds the /connections redirect target after a
