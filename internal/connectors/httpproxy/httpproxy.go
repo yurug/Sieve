@@ -24,12 +24,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"path"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/trilitech/Sieve/internal/connector"
 	"github.com/trilitech/Sieve/internal/httpguard"
@@ -209,6 +210,7 @@ type ProxyConnector struct {
 	authQueryParam         string              // empty = legacy header-only auth; non-empty = inject auth_value as URL query param under this name
 	extraHeaders           map[string]string
 	client                 *http.Client
+	limits                 Limits // per-call idle / header / ceiling limits (limits.go)
 }
 
 func Factory(config map[string]any) (connector.Connector, error) {
@@ -317,6 +319,7 @@ func Factory(config map[string]any) (connector.Connector, error) {
 		return nil, fmt.Errorf("http_proxy: outbound_allowlist: %w", err)
 	}
 
+	limits := LimitsFromEnv()
 	return &ProxyConnector{
 		targetURL:              targetURL,
 		authHeader:             authHeader,
@@ -327,12 +330,21 @@ func Factory(config map[string]any) (connector.Connector, error) {
 		additionalDeniedLookup: addLookup,
 		authQueryParam:         authQueryParam,
 		extraHeaders:           extraHeaders,
-		client: httpguard.Client(httpguard.ClientOptions{
-			Allowlist:        allowlist,
-			Timeout:          5 * time.Minute,
-			DisableRedirects: true, // preserve historical "surface 3xx to agent" behavior
-		}),
+		client:                 newClient(allowlist, limits),
+		limits:                 limits,
 	}, nil
+}
+
+// newClient builds the SSRF-guarded client. Its total Timeout is only the absolute ceiling
+// (limits.Max): the idle rule (ProxyConnector.do) is what ends a stalled call, so a model answer
+// that keeps streaming is never cut at a fixed total (VPA-X01 fork, 2026-10-02; was 5 min).
+func newClient(allowlist []netip.Prefix, limits Limits) *http.Client {
+	return httpguard.Client(httpguard.ClientOptions{
+		Allowlist:             allowlist,
+		Timeout:               limits.Max,
+		ResponseHeaderTimeout: limits.HeaderWait,
+		DisableRedirects:      true, // preserve historical "surface 3xx to agent" behavior
+	})
 }
 
 func (p *ProxyConnector) Type() string { return "http_proxy" }
@@ -540,7 +552,7 @@ func (p *ProxyConnector) Execute(ctx context.Context, op string, params map[stri
 		}
 	}
 
-	resp, err := p.client.Do(req)
+	resp, err := p.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http_proxy: request failed: %w", err)
 	}
@@ -590,7 +602,7 @@ func (p *ProxyConnector) Validate(ctx context.Context) error {
 		return err
 	}
 	req.Header.Set(p.authHeader, p.authValue)
-	resp, err := p.client.Do(req)
+	resp, err := p.do(req)
 	if err != nil {
 		return fmt.Errorf("http_proxy: target unreachable: %w", err)
 	}
@@ -763,7 +775,7 @@ func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxy
 		proxyReq.Header.Set(k, v)
 	}
 
-	resp, err := p.client.Do(proxyReq)
+	resp, err := p.do(proxyReq)
 	if err != nil {
 		http.Error(w, "proxy request failed: "+err.Error(), http.StatusBadGateway)
 		return "", false, fmt.Errorf("upstream request: %w", err)
@@ -779,7 +791,12 @@ func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxy
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		// The status line is out, so a failure now cannot become a 502: it must reach the agent
+		// as a BROKEN response (the router aborts on ErrUpstreamBodyCut), never a clean EOF.
+		if err := copyFlushing(w, resp.Body); err != nil {
+			log.Printf("http_proxy: %s %s: body relay failed after headers, aborting the response: %v", r.Method, cleaned, err)
+			return "", overridden, fmt.Errorf("%w: %v", ErrUpstreamBodyCut, err)
+		}
 		return "", overridden, nil
 	}
 

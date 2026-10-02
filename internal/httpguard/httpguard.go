@@ -29,6 +29,12 @@ type ClientOptions struct {
 	// 30 seconds (the documented default).
 	Timeout time.Duration
 
+	// ResponseHeaderTimeout bounds the wait for the response headers once the
+	// request is written. Zero means 30 seconds (DefaultResponseHeaderTimeout).
+	// http_proxy raises it for inference upstreams that send their headers
+	// only when a non-streamed answer is complete (VPA-X01 fork).
+	ResponseHeaderTimeout time.Duration
+
 	// LogRefusal, if non-nil, is invoked once for every request that
 	// httpguard refuses. The connector layer wires this to the audit
 	// log (`decision=ssrf_refused`).
@@ -89,6 +95,9 @@ const DefaultRedirectCap = 5
 
 // DefaultTimeout is the per-request timeout when ClientOptions.Timeout is zero.
 const DefaultTimeout = 30 * time.Second
+
+// DefaultResponseHeaderTimeout is the header wait when ClientOptions.ResponseHeaderTimeout is zero.
+const DefaultResponseHeaderTimeout = 30 * time.Second
 
 // resolveIPs is the hostname resolver. Tests replace this to drive
 // rebinding-style scenarios.
@@ -152,6 +161,10 @@ func Client(opts ClientOptions) *http.Client {
 	if timeout == 0 {
 		timeout = DefaultTimeout
 	}
+	headerTimeout := opts.ResponseHeaderTimeout
+	if headerTimeout == 0 {
+		headerTimeout = DefaultResponseHeaderTimeout
+	}
 	allowlist := append([]netip.Prefix(nil), opts.Allowlist...)
 	logRefusal := opts.LogRefusal
 
@@ -159,7 +172,7 @@ func Client(opts ClientOptions) *http.Client {
 	// these, a slow-loris peer (TCP open, no TLS handshake, no headers) can
 	// hold the dial open for the entire Timeout window. Set bounds on each
 	// phase so misbehaving upstreams fail fast even when the total budget is
-	// large (e.g. httpproxy's 5-minute streaming Timeout).
+	// large (e.g. httpproxy's 30-minute streaming ceiling).
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -206,7 +219,7 @@ func Client(opts ClientOptions) *http.Client {
 		DisableKeepAlives:     false,
 		ForceAttemptHTTP2:     true,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: headerTimeout,
 		IdleConnTimeout:       90 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}

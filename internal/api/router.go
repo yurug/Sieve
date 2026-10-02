@@ -907,6 +907,12 @@ func (rt *Router) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filterSummary, queryOverridden, err := proxy.ProxyHTTP(w, r, proxyPath, decision.Filters)
+	if errors.Is(err, httpproxy.ErrUpstreamBodyCut) {
+		// The status line already went out: abort the response so the agent sees a broken
+		// stream (no terminating chunk / RST_STREAM), never a clean end (VPA-X01 fork).
+		rt.logAudit(tok, connID, operation, nil, "http_proxy.upstream_body_cut", err.Error(), time.Since(start).Milliseconds())
+		panic(http.ErrAbortHandler)
+	}
 	if err != nil {
 		// W1.1: a denied header is a distinct deny class; the audit row uses
 		// http_proxy.header_denied so analytics can spot exploitation attempts.

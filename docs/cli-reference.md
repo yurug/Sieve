@@ -36,6 +36,18 @@ On startup the server:
 
 Graceful shutdown on SIGINT or SIGTERM with a 5-second timeout.
 
+HTTP proxy per-call limits (environment; Go durations like `120s` or bare seconds):
+
+| variable | default | meaning |
+|---|---|---|
+| `SIEVE_HTTP_PROXY_IDLE_TIMEOUT` | `120s` | after the response headers, the longest silence (no body byte) before the call is cut; a body that keeps flowing is never cut by it |
+| `SIEVE_HTTP_PROXY_HEADER_TIMEOUT` | `180s` | the longest wait for the upstream's response headers (a non-streamed LLM reply sends them only when complete) |
+| `SIEVE_HTTP_PROXY_MAX_DURATION` | `30m` | absolute ceiling per call, body included |
+
+A body cut after the headers were relayed (idle, ceiling, upstream error) is logged and the
+agent's response is aborted (connection reset / HTTP/2 RST_STREAM), never ended cleanly; the audit
+row is `http_proxy.upstream_body_cut`.
+
 ### OAuth app client flags
 
 To distribute Sieve so users don't register their own OAuth app, launch it with
