@@ -790,6 +790,7 @@ func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxy
 				w.Header().Add(key, v)
 			}
 		}
+		setUpstreamTLSHeaders(w.Header(), resp)
 		w.WriteHeader(resp.StatusCode)
 		// The status line is out, so a failure now cannot become a 502: it must reach the agent
 		// as a BROKEN response (the router aborts on ErrUpstreamBodyCut), never a clean EOF.
@@ -835,6 +836,7 @@ func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxy
 		}
 	}
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(respBody)))
+	setUpstreamTLSHeaders(w.Header(), resp)
 	w.WriteHeader(resp.StatusCode)
 	w.Write(respBody)
 	return filterSummary, overridden, nil
