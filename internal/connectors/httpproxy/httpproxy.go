@@ -178,6 +178,8 @@ var Meta = connector.ConnectorMeta{
 			HelpText: "When enabled (default), Sieve replaces every literal occurrence of the connection's auth value with [REDACTED] before the agent sees it. Defends against upstreams that echo Authorization back in error bodies."},
 		{Name: "auth_query_param", Label: "Auth query parameter", Type: "text", EditOnly: true, Editable: true, Placeholder: "appid",
 			HelpText: "When the upstream expects credentials in a URL query parameter (e.g. OpenWeather's ?appid=...) rather than a header, set the parameter name. Empty = header auth only."},
+		{Name: "auth_path_prefix", Label: "Auth path prefix", Type: "text", Editable: true, Placeholder: "/bot{value}",
+			HelpText: "When the upstream expects the credential in the URL path (e.g. Telegram's /bot<token>/<method>), a template with {value} once; it is prepended to every upstream path and the header is not sent. Empty = header auth."},
 		{Name: "additional_denied_headers", Label: "Additional denied headers", Type: "textarea", EditOnly: true, Editable: true, Placeholder: "X-Custom-Internal\nX-Tenant-ID",
 			HelpText: "One header key per line, case-insensitive. Adds to the built-in baseline deny-list; cannot remove from it."},
 		{Name: "outbound_allowlist", Label: "Outbound allow-list (CIDRs)", Type: "textarea", EditOnly: true, Editable: true,
@@ -208,6 +210,7 @@ type ProxyConnector struct {
 	additionalDenied       []string            // operator-supplied extras the connector ALSO denies (lowercased; never reduces the baseline)
 	additionalDeniedLookup map[string]struct{} // O(1) lookup over additionalDenied
 	authQueryParam         string              // empty = legacy header-only auth; non-empty = inject auth_value as URL query param under this name
+	authPathPrefix         string              // rendered auth_path_prefix (credential included); empty = no path credential (path_credential.go)
 	extraHeaders           map[string]string
 	client                 *http.Client
 	limits                 Limits // per-call idle / header / ceiling limits (limits.go)
@@ -229,13 +232,22 @@ func Factory(config map[string]any) (connector.Connector, error) {
 	if authValue == "" {
 		return nil, fmt.Errorf("http_proxy: missing auth_value")
 	}
+	// auth_path_prefix: the credential goes into the upstream path instead of
+	// a header (path_credential.go). Rendered from the RAW value, before any
+	// "Bearer " convenience below, which does not apply in this mode.
+	rawAuthPathPrefix, _ := config["auth_path_prefix"].(string)
+	authPathPrefix, err := renderAuthPathPrefix(rawAuthPathPrefix, authValue)
+	if err != nil {
+		return nil, err
+	}
+
 	// Convenience: when the auth header is "Authorization" and the value
 	// looks like a bare token (no space, so no scheme prefix), prepend
 	// "Bearer ". RFC 7235 requires a scheme; modern bearer-token APIs
 	// (Voyage, OpenAI, GitHub PATs over REST, etc.) all expect this form.
 	// A user who pasted "Bearer xxx" or "Basic xxx" already has a space
 	// and is left untouched, so existing setups don't change.
-	if strings.EqualFold(authHeader, "Authorization") && !strings.Contains(authValue, " ") {
+	if authPathPrefix == "" && strings.EqualFold(authHeader, "Authorization") && !strings.Contains(authValue, " ") {
 		authValue = "Bearer " + authValue
 	}
 
@@ -246,6 +258,9 @@ func Factory(config map[string]any) (connector.Connector, error) {
 	authValueScrub := true
 	if v, ok := config["auth_value_scrub"].(bool); ok {
 		authValueScrub = v
+	}
+	if authPathPrefix != "" {
+		authValueScrub = true // a credential in the URL is echoed more often than a header; no opt-out
 	}
 
 	// additional_denied_headers is the operator-supplied extension to the
@@ -329,6 +344,7 @@ func Factory(config map[string]any) (connector.Connector, error) {
 		additionalDenied:       cleaned,
 		additionalDeniedLookup: addLookup,
 		authQueryParam:         authQueryParam,
+		authPathPrefix:         authPathPrefix,
 		extraHeaders:           extraHeaders,
 		client:                 newClient(allowlist, limits),
 		limits:                 limits,
@@ -360,6 +376,7 @@ func (p *ProxyConnector) ConfigSchemaKeys() []string {
 		"auth_value",
 		"auth_value_scrub",
 		"auth_query_param",
+		"auth_path_prefix",
 		"additional_denied_headers",
 		"extra_headers",
 		"category",
@@ -496,6 +513,15 @@ func (p *ProxyConnector) Execute(ctx context.Context, op string, params map[stri
 	if i := strings.IndexByte(rawPath, '?'); i >= 0 {
 		rawPath, query = rawPath[:i], rawPath[i+1:]
 	}
+	if p.authPathPrefix != "" {
+		decoded, err := url.PathUnescape(rawPath)
+		if err != nil {
+			return nil, fmt.Errorf("http_proxy: invalid path: %w", err)
+		}
+		if err := checkPathCredentialAgentPath(rawPath, decoded); err != nil {
+			return nil, err
+		}
+	}
 	cleaned, err := validateProxyPath(rawPath)
 	if err != nil {
 		return nil, fmt.Errorf("http_proxy: invalid path: %w", err)
@@ -504,7 +530,10 @@ func (p *ProxyConnector) Execute(ctx context.Context, op string, params map[stri
 	if err != nil {
 		return nil, fmt.Errorf("http_proxy: invalid target URL: %w", err)
 	}
-	reqURL := targetBase.JoinPath(cleaned)
+	reqURL, err := p.upstreamURL(targetBase, cleaned)
+	if err != nil {
+		return nil, err
+	}
 	reqURL.RawQuery = query
 	if reqURL.Scheme != targetBase.Scheme || reqURL.Host != targetBase.Host {
 		return nil, fmt.Errorf("http_proxy: refusing to proxy to unexpected host %q", reqURL.Host)
@@ -517,7 +546,7 @@ func (p *ProxyConnector) Execute(ctx context.Context, op string, params map[stri
 
 	req, err := http.NewRequestWithContext(ctx, method, reqURL.String(), bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("http_proxy: create request: %w", err)
+		return nil, p.redactErr(fmt.Errorf("http_proxy: create request: %w", err))
 	}
 
 	// Inject auth_value as a URL query parameter when auth_query_param is
@@ -527,8 +556,10 @@ func (p *ProxyConnector) Execute(ctx context.Context, op string, params map[stri
 	// http_proxy.auth_query_overridden in the audit log.
 	overridden := p.injectAuthQueryParam(req.URL)
 
-	// Inject real auth credential.
-	req.Header.Set(p.authHeader, p.authValue)
+	// Inject real auth credential (a path credential is already in the URL).
+	if p.authPathPrefix == "" {
+		req.Header.Set(p.authHeader, p.authValue)
+	}
 
 	// Inject extra headers (e.g., anthropic-version).
 	for k, v := range p.extraHeaders {
@@ -554,13 +585,13 @@ func (p *ProxyConnector) Execute(ctx context.Context, op string, params map[stri
 
 	resp, err := p.do(req)
 	if err != nil {
-		return nil, fmt.Errorf("http_proxy: request failed: %w", err)
+		return nil, p.redactErr(fmt.Errorf("http_proxy: request failed: %w", err))
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("http_proxy: read response: %w", err)
+		return nil, p.redactErr(fmt.Errorf("http_proxy: read response: %w", err))
 	}
 
 	// Scrub the configured auth_value from the response body (curated surface).
@@ -586,10 +617,14 @@ func (p *ProxyConnector) Execute(ctx context.Context, op string, params map[stri
 		respBody = scrubbed
 	}
 
+	respHeaders := flattenHeaders(resp.Header)
+	for k, v := range respHeaders {
+		respHeaders[k] = p.redact(v)
+	}
 	return &ExecuteResult{
 		Status:              resp.StatusCode,
 		StatusText:          resp.Status,
-		Headers:             flattenHeaders(resp.Header),
+		Headers:             respHeaders,
 		Body:                string(respBody),
 		AuthQueryOverridden: overridden,
 	}, nil
@@ -601,10 +636,12 @@ func (p *ProxyConnector) Validate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set(p.authHeader, p.authValue)
+	if p.authPathPrefix == "" {
+		req.Header.Set(p.authHeader, p.authValue)
+	}
 	resp, err := p.do(req)
 	if err != nil {
-		return fmt.Errorf("http_proxy: target unreachable: %w", err)
+		return p.redactErr(fmt.Errorf("http_proxy: target unreachable: %w", err))
 	}
 	resp.Body.Close()
 	return nil
@@ -699,6 +736,13 @@ var headersInvalidatedByFiltering = map[string]bool{
 // been written to w in that case. Callers use the summary + override
 // flag to choose the audit-log policy_result identifier.
 func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxyPath string, filters []policy.ResponseFilter) (string, bool, error) {
+	if p.authPathPrefix != "" {
+		if err := checkPathCredentialAgentPath(r.URL.EscapedPath(), proxyPath); err != nil {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return "", false, err
+		}
+		filters = p.ensureScrubFilter(filters)
+	}
 	cleaned, err := validateProxyPath(proxyPath)
 	if err != nil {
 		http.Error(w, "invalid path", http.StatusBadRequest)
@@ -732,14 +776,19 @@ func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxy
 		http.Error(w, "invalid target URL configuration", http.StatusInternalServerError)
 		return "", false, fmt.Errorf("invalid target URL: %w", err)
 	}
-	// Use JoinPath to safely combine the base path with the proxy path.
-	targetURL := targetBase.JoinPath(cleaned)
+	// Use JoinPath to safely combine the base path (and any path-credential
+	// prefix) with the proxy path.
+	targetURL, err := p.upstreamURL(targetBase, cleaned)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return "", false, err
+	}
 	targetURL.RawQuery = r.URL.RawQuery
 
 	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), r.Body)
 	if err != nil {
 		http.Error(w, "failed to create proxy request", http.StatusInternalServerError)
-		return "", false, fmt.Errorf("create proxy request: %w", err)
+		return "", false, p.redactErr(fmt.Errorf("create proxy request: %w", err))
 	}
 
 	// Inject auth_value as a URL query parameter when auth_query_param is
@@ -767,8 +816,10 @@ func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxy
 		}
 	}
 
-	// Inject real auth credential.
-	proxyReq.Header.Set(p.authHeader, p.authValue)
+	// Inject real auth credential (a path credential is already in the URL).
+	if p.authPathPrefix == "" {
+		proxyReq.Header.Set(p.authHeader, p.authValue)
+	}
 
 	// Inject extra headers.
 	for k, v := range p.extraHeaders {
@@ -777,6 +828,7 @@ func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxy
 
 	resp, err := p.do(proxyReq)
 	if err != nil {
+		err = p.redactErr(err)
 		http.Error(w, "proxy request failed: "+err.Error(), http.StatusBadGateway)
 		return "", false, fmt.Errorf("upstream request: %w", err)
 	}
@@ -785,16 +837,13 @@ func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxy
 	// Fast path: when no filters are present, stream the response directly
 	// to avoid buffering the entire body (important for large/streaming responses).
 	if len(filters) == 0 {
-		for key, values := range resp.Header {
-			for _, v := range values {
-				w.Header().Add(key, v)
-			}
-		}
+		p.copyResponseHeaders(w.Header(), resp.Header, nil)
 		setUpstreamTLSHeaders(w.Header(), resp)
 		w.WriteHeader(resp.StatusCode)
 		// The status line is out, so a failure now cannot become a 502: it must reach the agent
 		// as a BROKEN response (the router aborts on ErrUpstreamBodyCut), never a clean EOF.
 		if err := copyFlushing(w, resp.Body); err != nil {
+			err = p.redactErr(err)
 			log.Printf("http_proxy: %s %s: body relay failed after headers, aborting the response: %v", r.Method, cleaned, err)
 			return "", overridden, fmt.Errorf("%w: %v", ErrUpstreamBodyCut, err)
 		}
@@ -807,7 +856,7 @@ func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxy
 	respBody, err := io.ReadAll(limitedBody)
 	if err != nil {
 		http.Error(w, "failed to read proxy response", http.StatusBadGateway)
-		return "", false, fmt.Errorf("read proxy response: %w", err)
+		return "", false, p.redactErr(fmt.Errorf("read proxy response: %w", err))
 	}
 	if int64(len(respBody)) > maxFilteredBodySize {
 		http.Error(w, "response too large to filter", http.StatusBadGateway)
@@ -827,14 +876,9 @@ func (p *ProxyConnector) ProxyHTTP(w http.ResponseWriter, r *http.Request, proxy
 
 	// Copy response headers, skipping headers that are no longer valid after
 	// the body has been modified (Content-Length is re-added below).
-	for key, values := range resp.Header {
-		if headersInvalidatedByFiltering[strings.ToLower(key)] {
-			continue
-		}
-		for _, v := range values {
-			w.Header().Add(key, v)
-		}
-	}
+	p.copyResponseHeaders(w.Header(), resp.Header, func(key string) bool {
+		return headersInvalidatedByFiltering[strings.ToLower(key)]
+	})
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(respBody)))
 	setUpstreamTLSHeaders(w.Header(), resp)
 	w.WriteHeader(resp.StatusCode)
