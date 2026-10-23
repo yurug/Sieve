@@ -53,13 +53,37 @@ var → build-time default** (Google's `defaultGoogleClientID`, injectable with
 [CLI reference → OAuth app client flags](cli-reference.md#oauth-app-client-flags).
 
 The `google` connection add and reauth forms also accept a closed
-`oauth_profile=gmail` value. It requests only `gmail.modify`; an omitted profile
+`oauth_profile=gmail` value. It requests only `gmail.readonly` + `gmail.compose`; an omitted profile
 retains the historical six-service request. The chosen profile is bound to the
 pending state and stored with the encrypted connection config. Ordinary reauth
 reuses that stored profile; an explicit Gmail reauth can request a narrower
 scope set for an older connection. Sieve records the token endpoint's granted
-scope separately and refuses a Gmail grant missing `gmail.modify`. This does
-not revoke any older Google grant.
+scope separately and refuses a Gmail grant missing either scope; a grant that
+also carries an older scope (e.g. `gmail.modify`) is accepted. This does
+not revoke any older Google grant. A connection authorized under the former
+`gmail.modify` profile keeps its stored token until its next reauth.
+
+On a `gmail`-profile connection whose recorded grant lacks `gmail.modify`
+(and `https://mail.google.com/`), the label operations `add_label`,
+`remove_label` and `archive` (also reached through the Gmail-compatible
+`POST .../messages/{id}/modify`) are refused before any call to Google with
+`operation_not_enabled` (HTTP 501), naming the missing permission. Search,
+read, threads, attachments, labels listing, drafts and sends are unaffected.
+A connection with no recorded grant keeps the historical behavior.
+
+### Revocation on delete
+
+Deleting a `google` connection (`POST /connections/{id}/delete`) first POSTs
+its refresh token (else its access token) to Google's revocation endpoint,
+`https://oauth2.googleapis.com/revoke`, which withdraws the whole grant. The
+row is deleted whatever the outcome. The outcome rides on the unchanged
+`303 /connections` redirect as `X-Sieve-Google-Revoke`: `revoked`,
+`already_invalid` (Google answered `invalid_token`: already revoked or
+expired), `no_token`, or `failed`. A failure is logged and audited
+(`connection.google_revoke`) with its kind (`transport`, `status`,
+`request`, `token_unreadable`) and HTTP status only, never the token, and is
+not retried: the stored token is gone, so the account owner withdraws the
+grant from their Google account permissions page if needed.
 
 ## Per-provider status
 

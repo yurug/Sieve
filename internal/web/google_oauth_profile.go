@@ -10,8 +10,15 @@ import (
 const (
 	googleProfileGeneral = "general"
 	googleProfileGmail   = "gmail"
-	gmailModifyScope     = "https://www.googleapis.com/auth/gmail.modify"
+	// The gmail profile asks for the narrowest scopes VPA's mail features need
+	// (Google restricted-scope verification): search and read, then drafts and
+	// sends. gmail.modify (labels, archive, trash) is not requested.
+	gmailReadonlyScope = "https://www.googleapis.com/auth/gmail.readonly"
+	gmailComposeScope  = "https://www.googleapis.com/auth/gmail.compose"
 )
+
+// gmailProfileScopes is a function so no caller can mutate a shared slice.
+func gmailProfileScopes() []string { return []string{gmailReadonlyScope, gmailComposeScope} }
 
 // An omitted profile is the historical, six-service Sieve connection. It is
 // deliberately not changed when an existing connection is re-authorized.
@@ -28,7 +35,7 @@ func googleOAuthProfile(raw string) (string, error) {
 
 func googleOAuthScopesFor(profile string) []string {
 	if profile == googleProfileGmail {
-		return []string{gmailModifyScope}
+		return gmailProfileScopes()
 	}
 	return append([]string(nil), googleOAuthScopes...)
 }

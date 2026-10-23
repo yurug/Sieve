@@ -346,7 +346,7 @@ spec:
 - **KMS / Vault / OS keyring providers.** Current design keeps the trust model simple (one passphrase, one admin). A KMS provider would offload key custody to AWS/GCP — useful for some deployments, but a different project from the passphrase-at-startup model shipped here.
 - **Memory hardening** (mlock, zero-on-free beyond KEK lifecycle events). An attacker with root on the running host can read the KEK from `/proc/<pid>/mem` or attach `gdb`/`ptrace`; mlock only marginally raises that bar while adding operational complexity. If you have a cold-boot threat model, air-gap the host.
 - **SQLCipher / whole-DB encryption.** Coarser than field-level (loses per-record DEKs), and SQLCipher's rotation story is more invasive than re-wrapping a handful of DEKs.
-- **Encryption of `audit_log.params`.** Audit rows contain the request payload, which can be sensitive (email bodies, API request bodies). They are in scope for a follow-up but kept out of this change because operators typically view them in the UI, and adding decryption there has knock-on UX costs. Filter audit retention instead for now (`audit.retention_days` in `sieve.yaml`).
+- **Encryption of `audit_log.params`.** Audit rows contain the request payload, which can be sensitive (email bodies, API request bodies). They are in scope for a follow-up but kept out of this change because operators typically view them in the UI, and adding decryption there has knock-on UX costs. Bound audit retention instead for now (`sieve serve --audit-retention-days`, default 30).
 
 ## Verification
 

@@ -120,6 +120,9 @@ type GoogleConnector struct {
 	sheetsClient   *gmailclient.SheetsClient
 	docsClient     *gmailclient.DocsClient
 	email          string
+	// grantedScopes is the recorded OAuth grant (nil when the connection has
+	// no record); see scope_gate.go.
+	grantedScopes map[string]bool
 }
 
 // persistingTokenSource wraps an oauth2.TokenSource and calls callbacks for
@@ -260,8 +263,10 @@ func Factory(config map[string]any) (connector.Connector, error) {
 	}
 
 	client := gmailclient.NewClient(svc, email)
+	granted, _ := grantedScopesFromConfig(config)
 
 	return &GoogleConnector{
+		grantedScopes:  granted,
 		client:         client,
 		driveClient:    gmailclient.NewDriveClient(driveSvc),
 		calendarClient: gmailclient.NewCalendarClient(calendarSvc),
@@ -833,6 +838,9 @@ var operations = []connector.OperationDef{
 
 // Execute routes an operation to the appropriate gmail.Client method.
 func (g *GoogleConnector) Execute(ctx context.Context, op string, params map[string]any) (any, error) {
+	if err := checkScopeGate(op, g.grantedScopes); err != nil {
+		return nil, err
+	}
 	switch op {
 	case "list_emails":
 		query := gmailclient.SearchQuery{

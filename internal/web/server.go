@@ -49,6 +49,7 @@ import (
 	"github.com/trilitech/Sieve/internal/connections"
 	"github.com/trilitech/Sieve/internal/connector"
 	"github.com/trilitech/Sieve/internal/database"
+	"github.com/trilitech/Sieve/internal/googlerevoke"
 	"github.com/trilitech/Sieve/internal/httpguard"
 	"github.com/trilitech/Sieve/internal/iampolicies"
 	"github.com/trilitech/Sieve/internal/operator"
@@ -106,6 +107,7 @@ type Server struct {
 	templates             map[string]*template.Template
 	googleCredentialsFile string
 	googleProfileLookup   func(*oauth2.Config, *oauth2.Token) (string, error) // test seam for Google's profile API
+	googleRevoker         *googlerevoke.Revoker                               // nil: Google's endpoint (google_revoke.go)
 
 	// oauthClients holds the shipped/launch-configured OAuth app client IDs
 	// (and, where applicable, non-confidential secrets) for providers whose
@@ -1046,11 +1048,17 @@ func (s *Server) handleConnectionAdd(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleConnectionDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// VPA-X01 fork: a Google connection's grant is withdrawn at Google first
+	// (google_revoke.go); the row is deleted whatever that outcome is.
+	revoke := s.revokeGoogleGrant(r.Context(), r, id)
 	if err := s.connections.Remove(id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	_ = s.audit.LogOperator(operatorDisplayName(r, s), "connection.delete", id, nil, "success")
+	if revoke != "" {
+		w.Header().Set(googleRevokeHeader, revoke)
+	}
 	http.Redirect(w, r, "/connections", http.StatusSeeOther)
 }
 

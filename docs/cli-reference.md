@@ -32,9 +32,15 @@ On startup the server:
 - Registers connector types (Google, HTTP Proxy, MCP Proxy)
 - Initializes all saved connections (decrypts configs using the derived KEK)
 - Seeds built-in policy presets (read-only, drafter, full-assist, triage)
-- Starts an audit log cleanup goroutine (purges entries older than 90 days, runs daily)
+- Starts the audit-log retention sweep: entries older than `--audit-retention-days` (default 30, at least 1) are purged at start and then daily. Audit rows hold request parameters in clear; the window bounds how long they live. A failed sweep is logged without content and retried at the next one.
 
 Graceful shutdown on SIGINT or SIGTERM with a 5-second timeout.
+
+| flag | default | meaning |
+|---|---|---|
+| `--audit-retention-days` | `30` | purge audit-log entries older than this many days (sweep at start, then every 24 h); `0` or negative refuses to start |
+| `--approval-ttl` | `0` (off) | auto-reject a pending approval after this long |
+| `--approval-webhook` | empty (off) | POST a content-free notification on each new approval |
 
 HTTP proxy per-call limits (environment; Go durations like `120s` or bare seconds):
 

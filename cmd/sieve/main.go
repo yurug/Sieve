@@ -163,6 +163,11 @@ func main() {
 			"POST a JSON notification ({id, token_id, connection_id, operation, created_at, "+
 				"expires_at} — never request_data) to this URL, best-effort, whenever a new "+
 				"approval is submitted. Empty (default) disables the webhook.")
+		// VPA-X01 fork: audit rows hold request parameters in clear, so they
+		// are purged after a bounded window (internal/audit/retention.go).
+		auditRetentionDays = flag.Int("audit-retention-days", audit.DefaultRetentionDays,
+			"purge audit-log entries older than this many days; the sweep runs at start and then "+
+				"daily. Must be at least 1. Default 30.")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags]\n", os.Args[0])
@@ -183,6 +188,11 @@ func main() {
 		log.Fatalf("sieve: --setup, --rotate-passphrase, and --reset-keyring are mutually exclusive")
 	}
 
+	if err := audit.ValidateRetentionDays(*auditRetentionDays); err != nil {
+		log.SetFlags(0)
+		log.Fatalf("sieve: --audit-retention-days: %v", err)
+	}
+
 	if *rotatePassphrase {
 		os.Exit(runRotate(*dbPath))
 	}
@@ -200,7 +210,7 @@ func main() {
 		AsanaClientID:      *asanaClientID,
 		AsanaClientSecret:  *asanaClientSecret,
 	}
-	if err := run(*dbPath, *webAddr, *apiAddr, *setup, *googleCredsPath, oauthClients, *approvalTTL, *approvalWebhookURL); err != nil {
+	if err := run(*dbPath, *webAddr, *apiAddr, *setup, *googleCredsPath, oauthClients, *approvalTTL, *approvalWebhookURL, *auditRetentionDays); err != nil {
 		log.SetFlags(0)
 		log.Fatalf("sieve: %v", err)
 	}
@@ -488,7 +498,7 @@ func operatorPrefersPlaintextAdmin(s *settings.Service) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "http://")
 }
 
-func run(dbPath, webAddr, apiAddr string, setup bool, googleCredsPath string, oauthClients web.OAuthClientConfig, approvalTTL time.Duration, approvalWebhookURL string) error {
+func run(dbPath, webAddr, apiAddr string, setup bool, googleCredsPath string, oauthClients web.OAuthClientConfig, approvalTTL time.Duration, approvalWebhookURL string, auditRetentionDays int) error {
 	// --- Keyring passphrase (BEFORE opening the DB) ---
 	// Acquire the passphrase first. When an operator opts into the fd source
 	// (SIEVE_PASSPHRASE_FD=3), opening the DB first would let SQLite grab fd 3
@@ -637,6 +647,12 @@ func run(dbPath, webAddr, apiAddr string, setup bool, googleCredsPath string, oa
 			}
 		}
 	}()
+
+	// Audit-log retention (VPA-X01 fork): purge rows older than
+	// --audit-retention-days at start, then daily. Content-free log lines.
+	retentionCtx, retentionCancel := context.WithCancel(context.Background())
+	defer retentionCancel()
+	go auditLog.RunRetention(retentionCtx, auditRetentionDays, audit.RetentionSweepInterval, log.Printf)
 
 	// --- API + MCP server (port 19817, agent-facing) ---
 	// Both share one listener; we mux /mcp to the MCP server, everything

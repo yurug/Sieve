@@ -211,6 +211,9 @@ curl -X POST "http://localhost:19817/gmail/v1/users/me/messages/MESSAGE_ID/modif
 `remove_label` / `archive`) is separately policy-gated. A request with more than
 one label across `addLabelIds`/`removeLabelIds` is rejected with `400` rather
 than silently applying only the first; issue a separate `modify` per label.
+On a connection granted only `gmail.readonly` + `gmail.compose` (the closed
+`gmail` OAuth profile), these label ops answer `501 operation_not_enabled`:
+Google's `messages.modify` needs `gmail.modify`.
 
 `GET /messages` additionally accepts repeated `labelIds` (restrict to messages
 carrying all listed labels) and `includeSpamTrash=true`, matching the Gmail

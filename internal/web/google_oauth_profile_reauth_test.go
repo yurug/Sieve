@@ -28,7 +28,7 @@ func TestGoogleOAuthProfileReauthKeepsIdentityAndRefresh(t *testing.T) {
 			t.Fatalf("reauth start: %d %s", rec.Code, rec.Body.String())
 		}
 		u, _ := url.Parse(rec.Header().Get("Location"))
-		if len(strings.Fields(u.Query().Get("scope"))) != 1 {
+		if strings.Join(strings.Fields(u.Query().Get("scope")), " ") != gmailReadonlyScope+" "+gmailComposeScope {
 			t.Fatal("legacy reauth was not narrowed")
 		}
 		return u.Query().Get("state")
@@ -47,7 +47,7 @@ func TestGoogleOAuthProfileReauthKeepsIdentityAndRefresh(t *testing.T) {
 	if read()["oauth_profile"] != googleProfileGeneral {
 		t.Error("partial reauth replaced legacy config")
 	}
-	mockGoogle(t, gmailModifyScope, "new-refresh", email)
+	mockGoogle(t, gmailReadonlyScope+" "+gmailComposeScope, "new-refresh", email)
 	email = "other@example.com"
 	if rec := completeGoogle(t, s, env, start()); rec.Code != http.StatusBadRequest {
 		t.Errorf("identity swap: %d", rec.Code)
@@ -56,7 +56,7 @@ func TestGoogleOAuthProfileReauthKeepsIdentityAndRefresh(t *testing.T) {
 		t.Error("identity mismatch replaced legacy config")
 	}
 	email = "owner@example.com"
-	mockGoogle(t, gmailModifyScope, "", email)
+	mockGoogle(t, gmailReadonlyScope+" "+gmailComposeScope, "", email)
 	changed := profilePost(t, s, env, "/connections/mailbox/reauth", url.Values{
 		"oauth_profile": {"gmail"}, "google_client_id": {"different.apps.googleusercontent.com"},
 	})
@@ -70,7 +70,7 @@ func TestGoogleOAuthProfileReauthKeepsIdentityAndRefresh(t *testing.T) {
 	if read()["client_id"] != "original.apps.googleusercontent.com" {
 		t.Error("new client inherited stale refresh token")
 	}
-	mockGoogle(t, gmailModifyScope, "", email)
+	mockGoogle(t, gmailReadonlyScope+" "+gmailComposeScope, "", email)
 	if rec := completeGoogle(t, s, env, start()); rec.Code != http.StatusSeeOther {
 		t.Fatalf("reauth: %d %s", rec.Code, rec.Body.String())
 	}
@@ -103,7 +103,7 @@ func TestGoogleOAuthProfileScopesAndReauth(t *testing.T) {
 		id, profile string
 		count       int
 	}{
-		{"gmail-only", "gmail", 1}, {"legacy", "", 6},
+		{"gmail-only", "gmail", 2}, {"legacy", "", 6},
 	} {
 		rec := add(tc.id, tc.profile)
 		if rec.Code != http.StatusFound {
@@ -114,7 +114,7 @@ func TestGoogleOAuthProfileScopesAndReauth(t *testing.T) {
 		if len(scopes) != tc.count {
 			t.Errorf("%s: scopes=%v", tc.id, scopes)
 		}
-		if tc.profile == "gmail" && (len(scopes) != 1 || scopes[0] != "https://www.googleapis.com/auth/gmail.modify") {
+		if tc.profile == "gmail" && strings.Join(scopes, " ") != gmailReadonlyScope+" "+gmailComposeScope {
 			t.Errorf("gmail-only URL requested other Google services: %v", scopes)
 		}
 		if u.Query().Get("code_challenge") == "" || u.Query().Get("state") == "" {
@@ -131,7 +131,7 @@ func TestGoogleOAuthProfileScopesAndReauth(t *testing.T) {
 		id, profile string
 		count       int
 	}{
-		{"saved-gmail", "gmail", 1}, {"saved-legacy", "", 6},
+		{"saved-gmail", "gmail", 2}, {"saved-legacy", "", 6},
 	} {
 		config := map[string]any{"email": tc.id + "@example.com", "client_id": "test.apps.googleusercontent.com"}
 		if tc.profile != "" {
@@ -156,7 +156,7 @@ func TestGoogleOAuthProfileScopesAndReauth(t *testing.T) {
 		t.Fatalf("explicit Gmail reauth: %d %s", rec.Code, rec.Body.String())
 	}
 	u, _ := url.Parse(rec.Header().Get("Location"))
-	if scopes := strings.Fields(u.Query().Get("scope")); len(scopes) != 1 || scopes[0] != gmailModifyScope {
+	if scopes := strings.Fields(u.Query().Get("scope")); strings.Join(scopes, " ") != gmailReadonlyScope+" "+gmailComposeScope {
 		t.Errorf("explicit Gmail reauth scopes=%v", scopes)
 	}
 }

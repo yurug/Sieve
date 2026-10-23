@@ -66,15 +66,17 @@ func profileTestServer(t *testing.T) (*Server, *testenv.Env) {
 }
 
 func TestGoogleGrantedScopesProvenance(t *testing.T) {
-	required := []string{gmailModifyScope}
+	required := gmailProfileScopes()
+	pair := strings.Join(required, " ")
 	for _, tc := range []struct {
 		name, scope, source string
 		ok                  bool
 	}{
 		{"omitted means requested", "", "request", true},
-		{"token exact", gmailModifyScope, "token", true},
-		{"partial", "https://www.googleapis.com/auth/gmail.readonly", "", false},
-		{"old broader grant", gmailModifyScope + " https://www.googleapis.com/auth/drive", "token", true},
+		{"token exact", pair, "token", true},
+		{"partial", gmailReadonlyScope, "", false},
+		{"modify alone is not the pair", "https://www.googleapis.com/auth/gmail.modify", "", false},
+		{"old broader grant", pair + " https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/drive", "token", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tok := &oauth2.Token{AccessToken: "access"}
@@ -88,7 +90,7 @@ func TestGoogleGrantedScopesProvenance(t *testing.T) {
 			if tc.ok && (source != tc.source || len(scopes) != len(strings.Fields(tc.scope)) && tc.scope != "") {
 				t.Errorf("source=%q scopes=%v", source, scopes)
 			}
-			if tc.scope == "" && (source != "request" || len(scopes) != 1 || scopes[0] != gmailModifyScope) {
+			if tc.scope == "" && (source != "request" || strings.Join(scopes, " ") != pair) {
 				t.Errorf("omitted-scope provenance=%q scopes=%v", source, scopes)
 			}
 		})
@@ -101,8 +103,8 @@ func TestGoogleOAuthProfileCallbackDurability(t *testing.T) {
 		accepted    bool
 	}{
 		{"omitted scope", "", true},
-		{"reduced grant", "https://www.googleapis.com/auth/gmail.readonly", false},
-		{"broader existing grant", gmailModifyScope + " https://www.googleapis.com/auth/drive", true},
+		{"reduced grant", gmailReadonlyScope, false},
+		{"broader existing grant", gmailReadonlyScope + " " + gmailComposeScope + " https://www.googleapis.com/auth/gmail.modify", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, env := profileTestServer(t)
@@ -151,7 +153,7 @@ func TestGoogleOAuthProfileCallbackDurability(t *testing.T) {
 
 func TestGoogleLegacyGeneralPartialGrantRemainsAccepted(t *testing.T) {
 	s, env := profileTestServer(t)
-	mockGoogle(t, gmailModifyScope, "legacy-refresh", "owner@example.com")
+	mockGoogle(t, gmailReadonlyScope+" "+gmailComposeScope, "legacy-refresh", "owner@example.com")
 	s.googleProfileLookup = func(_ *oauth2.Config, _ *oauth2.Token) (string, error) { return "owner@example.com", nil }
 	add := profilePost(t, s, env, "/connections/add", url.Values{
 		"id": {"legacy"}, "connector_type": {"google"}, "display_name": {"Legacy"},
